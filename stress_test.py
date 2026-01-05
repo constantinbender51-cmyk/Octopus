@@ -24,6 +24,7 @@ class StressTester:
         self.pat = pat
         self.logs = []
         self.equity = 0.0
+        self.instrument_specs = {}
 
     def log(self, message):
         """Log to local stdout and append to internal log for upload."""
@@ -32,9 +33,32 @@ class StressTester:
         slow_print(formatted_msg)
         self.logs.append(formatted_msg)
 
+    def _fetch_instrument_specs(self):
+        """Fetches lot size and tick size to ensure valid orders."""
+        self.log("Fetching Instrument Specifications...")
+        try:
+            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
+            resp = requests.get(url, timeout=10).json()
+            if "instruments" in resp:
+                for inst in resp["instruments"]:
+                    sym = inst["symbol"].lower()
+                    self.instrument_specs[sym] = {
+                        "lotSize": float(inst.get("lotSize", 1.0)),
+                        "tickSize": float(inst.get("tickSize", 0.1)),
+                        "contractSize": float(inst.get("contractSize", 1.0))
+                    }
+                self.log(f"Success: Loaded specs for {len(self.instrument_specs)} instruments.")
+            else:
+                self.log("Warning: Failed to parse instruments (no 'instruments' key).")
+        except Exception as e:
+            self.log(f"Error fetching specs: {e}")
+
     def run(self):
         self.log("--- STARTING STRESS TEST ---")
         
+        # 0. Load Specs (Crucial for invalidSize fix)
+        self._fetch_instrument_specs()
+
         # 1. API Connectivity & Account Info
         self.log("1. Testing Account API & Fetching Equity...")
         try:
@@ -100,15 +124,39 @@ class StressTester:
                 self.log(f"SKIPPING: Could not get mark price for {symbol}")
                 return
 
-            # B. Calculate Size in Contracts
-            # Assuming linear for simplicity, check if inverse logic needed in real prod
-            size = usd_size / mark_price
-            if size < 0.0001: size = 0.0001 # Min size safety
-            size = round(size, 4)
+            # B. Calculate Size in Contracts (WITH VALIDATION)
+            raw_size = usd_size / mark_price
+            
+            # --- FIX: Apply Lot Size Rounding ---
+            specs = self.instrument_specs.get(symbol.lower())
+            
+            if specs:
+                lot_size = specs['lotSize']
+                # Round to nearest lot_size
+                size = round(raw_size / lot_size) * lot_size
+                
+                # If lot_size is integer (e.g. 1.0), ensure int
+                if lot_size.is_integer():
+                    size = int(size)
+                else:
+                    # Determine precision from lot_size
+                    decimals = 0
+                    if "." in str(lot_size):
+                         decimals = len(str(lot_size).split(".")[1])
+                    size = round(size, decimals)
+                
+                self.log(f"   Debug: {symbol} LotSize: {lot_size}, Raw: {raw_size:.4f}, Rounded: {size}")
+            else:
+                self.log(f"   Warning: No specs for {symbol}, using default rounding.")
+                size = round(raw_size, 3)
+            # ------------------------------------
+
+            if size <= 0:
+                self.log(f"SKIPPING: Size {size} is too small/zero.")
+                return
 
             # C. Place 'Safe' Limit Order
-            # Place buy limit 50% BELOW market to ensure it is PLACED but NOT FILLED
-            # This tests the API functionality without taking market risk during a test.
+            # Place buy limit 50% BELOW market
             safe_limit_price = round(mark_price * 0.5, 2)
             
             self.log(f"Placing LIMIT BUY {size} @ {safe_limit_price} (Mark: {mark_price})")
@@ -135,11 +183,8 @@ class StressTester:
             # D. Verify 'Placed' Status
             time.sleep(0.5) # Wait for engine
             check = self.kf.get_order(order_id)
-            # Response handling for get_order depends on exact API return (list or dict)
-            # Assuming standard behavior, often returns a list of orders queried
             found_status = "unknown"
             if isinstance(check, dict) and "orders" in check:
-                 # Some endpoints return { orders: [ ... ] }
                  found_status = check["orders"][0].get("status")
             elif isinstance(check, list) and len(check) > 0:
                  found_status = check[0].get("status")
@@ -152,8 +197,6 @@ class StressTester:
             self.log(f"Cancel Response: {cancel_resp}")
 
             # F. Close Position (If exists)
-            # We check if we accidentally have a position (or if one existed before test)
-            # and simulate the "Close Position" logic
             self._check_and_close_position(symbol)
 
         except Exception as e:
