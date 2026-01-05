@@ -3,7 +3,7 @@ import json
 import base64
 import requests
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 # Configure Logger for Stress Test
 logging.basicConfig(level=logging.INFO)
@@ -181,11 +181,14 @@ class StressTester:
             time.sleep(0.5)
             self.log(f"Cancelling Order {order_id}...")
             
-            # Trying to fix 'requiredArgumentMissing' by sending symbol as well, 
-            # and ensuring orderId is correct key.
+            # --- FIX: Required Arguments for Cancellation ---
+            # Format: 2023-11-08T19:56:35.441899Z
+            process_before = (datetime.now(timezone.utc) + timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+            
             cancel_payload = {
-                "orderId": order_id,
-                "symbol": symbol 
+                "order_id": order_id, # User specified snake_case 'order_id'
+                "symbol": symbol,
+                "processBefore": process_before
             }
             
             try:
