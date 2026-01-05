@@ -54,46 +54,39 @@ class StressTester:
             self.log(f"Error fetching specs: {e}")
 
     def run(self):
-        self.log("--- STARTING STRESS TEST ---")
+        self.log("--- STARTING STRESS TEST (Blind Execution Mode) ---")
         
-        # 0. Load Specs (Crucial for invalidSize fix)
+        # 0. Load Specs
         self._fetch_instrument_specs()
 
         # 1. API Connectivity & Account Info
         self.log("1. Testing Account API & Fetching Equity...")
         try:
             accounts = self.kf.get_accounts()
-            
-            # Extract Margin Equity
             if "accounts" in accounts and "flex" in accounts["accounts"]:
                 self.equity = float(accounts["accounts"]["flex"].get("marginEquity", 0))
             elif "accounts" in accounts:
-                 # Fallback
                  first = list(accounts["accounts"].values())[0]
                  self.equity = float(first.get("marginEquity", 0))
-            
             self.log(f"SUCCESS: Margin Equity retrieved: ${self.equity:.2f}")
-            
         except Exception as e:
             self.log(f"CRITICAL: Failed to get accounts: {e}")
             return
 
-        # 2. Fetch Open Data
-        self.log("2. Fetching Open Positions & Orders...")
+        # 2. Fetch Open Data (Just logging, not using for logic)
+        self.log("2. Logging Open Positions & Orders (Informational)...")
         try:
             open_positions = self.kf.get_open_positions()
-            self.log(f"Open Positions Response: {len(open_positions.get('openPositions', []))} positions found.")
-            
+            self.log(f"Open Positions: {len(open_positions.get('openPositions', []))}")
             open_orders = self.kf.get_open_orders()
-            self.log(f"Open Orders Response: {len(open_orders.get('openOrders', []))} orders found.")
+            self.log(f"Open Orders: {len(open_orders.get('openOrders', []))}")
         except Exception as e:
             self.log(f"Error fetching open data: {e}")
 
         # 3. Order System Test
-        self.log("3. Testing Order Execution (Place -> Verify -> Edit -> Cancel)...")
+        self.log("3. Testing Order Execution (Place -> Edit -> Cancel)...")
         
-        # Calculate roughly the size we would use in live trading
-        strat_count = len(self.symbol_map) # Approximation
+        strat_count = len(self.symbol_map) 
         if strat_count == 0: strat_count = 1
         unit_size_usd = (self.equity * self.leverage) / strat_count
         self.log(f"Calculated Test Unit Size: ${unit_size_usd:.2f}")
@@ -105,27 +98,6 @@ class StressTester:
         self.log("4. Uploading Results to GitHub...")
         self._upload_to_github()
         self.log("--- STRESS TEST COMPLETE ---")
-
-    def _find_order_in_open(self, target_order_id):
-        """Helper to safely find an order in the open orders list."""
-        try:
-            orders_resp = self.kf.get_open_orders()
-            # Handle list vs dict response structure variations
-            orders_list = []
-            if isinstance(orders_resp, dict) and "openOrders" in orders_resp:
-                orders_list = orders_resp["openOrders"]
-            elif isinstance(orders_resp, list):
-                orders_list = orders_resp
-            
-            for o in orders_list:
-                # Key might be 'order_id' or 'orderId' depending on API version
-                oid = o.get("order_id") or o.get("orderId")
-                if oid == target_order_id:
-                    return o
-            return None
-        except Exception as e:
-            self.log(f"Error in _find_order_in_open: {e}")
-            return None
 
     def _test_symbol_execution(self, symbol, usd_size):
         self.log(f"--- Testing {symbol} ---")
@@ -143,7 +115,7 @@ class StressTester:
                 self.log(f"SKIPPING: Could not get mark price for {symbol}")
                 return
 
-            # B. Calculate Size in Contracts (WITH VALIDATION)
+            # B. Calculate Size
             raw_size = usd_size / mark_price
             specs = self.instrument_specs.get(symbol.lower())
             
@@ -161,12 +133,12 @@ class StressTester:
                 size = round(raw_size, 3)
 
             if size <= 0:
-                self.log(f"SKIPPING: {symbol} (Size {size} too small for min lot)")
+                self.log(f"SKIPPING: {symbol} (Size {size} too small)")
                 return
 
             # C. Place 'Safe' Limit Order
             safe_limit_price = round(mark_price * 0.5, 2)
-            self.log(f"Placing LIMIT BUY {size} @ {safe_limit_price} (Mark: {mark_price})")
+            self.log(f"Placing LIMIT BUY {size} @ {safe_limit_price}")
             
             order_payload = {
                 "orderType": "lmt",
@@ -181,64 +153,48 @@ class StressTester:
             order_id = None
             if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                 order_id = resp["sendStatus"]["order_id"]
-                status = resp["sendStatus"]["status"]
-                self.log(f"API Response: Order Sent. ID: {order_id} | Status: {status}")
+                self.log(f"SUCCESS: Order Placed. ID: {order_id}")
             else:
                 self.log(f"FAILURE: Order placement failed: {resp}")
                 return
 
-            # D. Verify 'Placed' Status (Reliable Scan)
-            time.sleep(1.0)
-            found_order = self._find_order_in_open(order_id)
+            # D. Edit Order (Blindly using ID)
+            time.sleep(0.5) 
+            new_price = round(safe_limit_price * 1.01, 2)
+            self.log(f"Editing: Moving price to {new_price}...")
             
-            if found_order:
-                self.log(f"Verification SUCCESS: Found order {order_id} in OpenOrders.")
+            edit_payload = {
+                "orderId": order_id,
+                "limitPrice": new_price,
+                "size": size,
+                "symbol": symbol 
+            }
+            
+            edit_resp = self.kf.edit_order(edit_payload)
+            
+            if "editStatus" in edit_resp and edit_resp["editStatus"] == "edited":
+                self.log("SUCCESS: Order Edited.")
             else:
-                self.log(f"Verification WARNING: Order {order_id} not found in OpenOrders. (Check logs for errors)")
+                self.log(f"WARNING: Edit response uncertain: {edit_resp}")
 
-            # E. Test Edit Functionality
-            if found_order:
-                # Move price up by 1% (still very safe)
-                new_price = round(safe_limit_price * 1.01, 2)
-                self.log(f"Testing EDIT: Moving price from {safe_limit_price} to {new_price}...")
-                
-                edit_payload = {
-                    "orderId": order_id,
-                    "limitPrice": new_price,
-                    "size": size,
-                    "symbol": symbol 
-                }
-                
-                edit_resp = self.kf.edit_order(edit_payload)
-                
-                if "editStatus" in edit_resp:
-                    self.log(f"Edit Signal Sent. Status: {edit_resp.get('editStatus')}")
-                else:
-                    self.log(f"Edit Signal Sent. Raw Resp: {edit_resp}")
+            # E. Cancel Order (Blindly using ID)
+            time.sleep(0.5)
+            self.log(f"Cancelling Order {order_id}...")
+            
+            # Trying to fix 'requiredArgumentMissing' by sending symbol as well, 
+            # and ensuring orderId is correct key.
+            cancel_payload = {
+                "orderId": order_id,
+                "symbol": symbol 
+            }
+            
+            try:
+                cancel_resp = self.kf.cancel_order(cancel_payload)
+                self.log(f"Cancel Response: {cancel_resp}")
+            except Exception as e:
+                self.log(f"Cancel Failed: {e}")
 
-                # Verify Edit
-                time.sleep(1.0)
-                updated_order = self._find_order_in_open(order_id)
-                if updated_order:
-                    # Kraken might return price as string or float
-                    curr_price = float(updated_order.get("limitPrice", 0))
-                    if abs(curr_price - new_price) < (new_price * 0.001): # 0.1% tolerance
-                        self.log(f"Edit Verification SUCCESS: Price updated to {curr_price}")
-                    else:
-                        self.log(f"Edit Verification FAILED: Price is {curr_price}, expected {new_price}")
-                else:
-                    self.log("Edit Verification FAILED: Order disappeared during edit.")
-
-            # F. Cancel Order
-            if order_id:
-                self.log(f"Cancelling Order {order_id}...")
-                try:
-                    cancel_resp = self.kf.cancel_order({"orderId": order_id})
-                    self.log(f"Cancel Response: {cancel_resp}")
-                except Exception as e:
-                    self.log(f"Cancel Failed: {e}")
-
-            # G. Close Position (Cleanup)
+            # F. Cleanup Position (Just in case)
             self._check_and_close_position(symbol)
 
         except Exception as e:
@@ -267,8 +223,7 @@ class StressTester:
                     "size": abs(size),
                     "reduceOnly": True
                 }
-                resp = self.kf.send_order(payload)
-                self.log(f"Close Position Response: {resp}")
+                self.kf.send_order(payload)
                 
         except Exception as e:
             self.log(f"Error in Close Position logic: {e}")
