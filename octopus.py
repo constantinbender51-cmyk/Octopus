@@ -221,22 +221,53 @@ class Octopus:
             logger.error(f"Failed to load strategies: {e}")
 
     def _fetch_initial_data(self):
-        """Fetches 15m data for all active assets from Binance (last 2000 candles)."""
+        """Fetches all 15m data since 2020 for all active assets from Binance."""
         active_assets = set(s.asset for s in self.strategies.values())
-        logger.info(f"Fetching historical data for {len(active_assets)} assets...")
+        logger.info(f"Fetching historical data for {len(active_assets)} assets (Since 2020)...")
+        
+        # 2020-01-01 00:00:00 UTC timestamp in milliseconds
+        start_timestamp_2020 = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
         
         for asset in active_assets:
             try:
                 # Binance requires Symbol, e.g. BTCUSDT
                 url = "https://api.binance.com/api/v3/klines"
-                params = {"symbol": asset, "interval": "15m", "limit": 1000} # Get plenty
-                r = requests.get(url, params=params)
-                data = r.json()
                 
-                # Store (Time, Close)
-                self.price_history[asset] = [(int(x[6]), float(x[4])) for x in data]
-                logger.info(f"Loaded {len(data)} candles for {asset}")
-                time.sleep(0.1) # Rate limit nice
+                all_candles = []
+                current_start = start_timestamp_2020
+                
+                while True:
+                    params = {
+                        "symbol": asset, 
+                        "interval": "15m", 
+                        "limit": 1000,
+                        "startTime": current_start
+                    }
+                    
+                    r = requests.get(url, params=params)
+                    data = r.json()
+                    
+                    if not data or not isinstance(data, list):
+                        break
+                        
+                    all_candles.extend(data)
+                    
+                    # Check if we reached the end (fewer than limit returned)
+                    if len(data) < 1000:
+                        break
+                        
+                    # Update start time for next batch
+                    # Index 6 is Close Time. We want next candle, so +1ms
+                    last_close_time = int(data[-1][6])
+                    current_start = last_close_time + 1
+                    
+                    # Rate limit safety
+                    time.sleep(0.1)
+                
+                # Store (Time, Close) -> Index 6 is Close Time, Index 4 is Close Price
+                self.price_history[asset] = [(int(x[6]), float(x[4])) for x in all_candles]
+                logger.info(f"Loaded {len(all_candles)} candles for {asset} since 2020")
+                
             except Exception as e:
                 logger.error(f"Error fetching data for {asset}: {e}")
 
@@ -327,8 +358,15 @@ class Octopus:
                         self.price_history[asset].append((ts, price))
                         
                 # Trim list to keep memory sane (last 5000 is plenty)
-                if len(self.price_history[asset]) > 5000:
-                    self.price_history[asset] = self.price_history[asset][-5000:]
+                # NOTE: Since we are training on long history, we might want to keep more than 5000 now?
+                # However, for live inference, we likely only need the tail. 
+                # If we re-train periodically, we need all history.
+                # Assuming strategies are trained once at startup, we might not need all history 
+                # UNLESS we re-train regularly. The current logic trains once in `initialize`.
+                # If we want to keep the full history for future features, we can remove the trim or increase it.
+                # I'll increase it to 200,000 to cover the years fetched, just in case logic changes.
+                if len(self.price_history[asset]) > 200000:
+                    self.price_history[asset] = self.price_history[asset][-200000:]
                     
             except Exception as e:
                 logger.error(f"Update failed for {asset}: {e}")
