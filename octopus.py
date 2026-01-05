@@ -46,7 +46,7 @@ GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/content
 
 # Asset Mapping (Binance USDT -> Kraken Futures Perpetual)
 SYMBOL_MAP = {
-    "BTCUSDT": "pf_xbtusd",
+    "BTCUSDT": "ff_xbtusd_261225",
     "ETHUSDT": "pf_ethusd",
     "SOLUSDT": "pf_solusd",
     "BNBUSDT": "pf_bnbusd",
