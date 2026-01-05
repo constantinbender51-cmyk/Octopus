@@ -14,6 +14,7 @@ import threading
 import requests
 import pandas as pd
 import numpy as np
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -56,11 +57,26 @@ SYMBOL_MAP = {
     "AVAXUSDT": "pf_avaxusd",
     "DOTUSDT": "pf_dotusd",
     "LINKUSDT": "pf_linkusd",
-    # Add others if needed
 }
 
 # Reverse map for logging
 REVERSE_MAP = {v: k for k, v in SYMBOL_MAP.items()}
+
+# Tick Size Configuration
+# Maps internal identifiers (lowercase) to tick sizes
+TICK_SIZES = {
+    "ada": 0.00001,
+    "eth": 0.1,
+    "sol": 0.01,
+    "bnb": 0.01,
+    "xrp": 0.00001,
+    "doge": 0.000001,
+    "avax": 0.001,
+    "link": 0.001,
+    "dot": 0.001,
+    "xbt": 1,    # BTC usually XBT on Kraken
+    "btc": 1,
+}
 
 # Logging Setup
 logging.basicConfig(
@@ -304,6 +320,46 @@ class Octopus:
         resampled = df['price'].resample(target).last().dropna()
         return resampled.tolist()
 
+    def _get_tick_size(self, symbol: str) -> float:
+        """Returns the tick size for a given Kraken symbol."""
+        s_lower = symbol.lower()
+        for key, tick in TICK_SIZES.items():
+            if key in s_lower:
+                return tick
+        # Default fallback if not found (safer to be precise than loose)
+        return 0.001
+
+    def _format_price(self, price: float, symbol: str) -> float:
+        """
+        Rounds price to the nearest tick size and formats it correctly.
+        Returns a float if the API handles it, but ensures the value is mathematically aligned.
+        Kraken API often requires the JSON payload to have the number.
+        However, the *value* must be quantized.
+        """
+        tick = self._get_tick_size(symbol)
+        
+        # Quantize to tick size
+        # Logic: round(price / tick) * tick
+        # Using Decimal to avoid floating point artifacts (e.g. 3000.100000002)
+        
+        d_price = Decimal(str(price))
+        d_tick = Decimal(str(tick))
+        
+        quantized = (d_price / d_tick).quantize(Decimal('1'), rounding=ROUND_HALF_UP) * d_tick
+        
+        # Return as float for JSON serialization, but it's now a clean tick multiple
+        # e.g. 50000.0 (float) or 2.343 (float)
+        # Note: If Kraken strictly needs integer "50000" and not "50000.0" in JSON, 
+        # the standard json serializer usually handles floats with .0.
+        # However, the requirement "50000 not 50000.0" usually implies string formatting or int type.
+        # Python's `json.dumps` turns int-like floats into floats (50000.0).
+        # We might need to return int if it's a whole number tick.
+        
+        if tick >= 1:
+            return int(quantized)
+        else:
+            return float(quantized)
+
     # --- Core Loop Logic ---
 
     def run(self):
@@ -357,14 +413,7 @@ class Octopus:
                     if ts > last_stored_ts:
                         self.price_history[asset].append((ts, price))
                         
-                # Trim list to keep memory sane (last 5000 is plenty)
-                # NOTE: Since we are training on long history, we might want to keep more than 5000 now?
-                # However, for live inference, we likely only need the tail. 
-                # If we re-train periodically, we need all history.
-                # Assuming strategies are trained once at startup, we might not need all history 
-                # UNLESS we re-train regularly. The current logic trains once in `initialize`.
-                # If we want to keep the full history for future features, we can remove the trim or increase it.
-                # I'll increase it to 200,000 to cover the years fetched, just in case logic changes.
+                # Trim list
                 if len(self.price_history[asset]) > 200000:
                     self.price_history[asset] = self.price_history[asset][-200000:]
                     
@@ -378,9 +427,6 @@ class Octopus:
         try:
             acc = self.kf.get_accounts()
             # Navigate complex structure to find Equity
-            # accounts -> fi_xbtusd -> auxiliary -> pv (Portfolio Value) or marginEquity
-            # Fallback to a simpler key if specific path fails, but 'marginEquity' is standard.
-            # Based on user image: flex -> marginEquity
             if "flex" in acc.get("accounts", {}):
                 equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
             else:
@@ -397,8 +443,6 @@ class Octopus:
             return
 
         # 2. Calculate Unit Size
-        # Formula: Capital * 1 / (Total_Strategies / Leverage)
-        # = (Capital * Leverage) / Total_Strategies
         if self.total_strategies_count == 0: return
         unit_size_usd = (equity * LEVERAGE) / self.total_strategies_count
         logger.info(f"Equity: ${equity:.2f} | Unit Size: ${unit_size_usd:.2f}")
@@ -427,8 +471,6 @@ class Octopus:
                 logger.info(f"Strategy {s.id}: Signal {sig} -> VirtPos ${s.virtual_position:.2f}")
 
         # 4. Aggregation & Execution (Per Asset)
-        futures_map = {k: [] for k in active_assets}
-        
         # Launch parallel execution for each asset
         for asset in active_assets:
             self.executor.submit(self._execute_asset_logic, asset)
@@ -447,10 +489,9 @@ class Octopus:
                 net_target_usd += s.virtual_position
 
         # B. Get Current Position on Kraken
+        # NOTE: Using lower() for reading/comparing data (all other requests)
         try:
             open_pos = self.kf.get_open_positions()
-            # Response: {"result": "success", "openPositions": [...]}
-            # Structure usually list of dicts.
             current_pos_size = 0.0
             
             if "openPositions" in open_pos:
@@ -468,7 +509,6 @@ class Octopus:
         # C. Get Market Price for Conversion (USD -> Contracts)
         try:
             tickers = self.kf.get_tickers()
-            # Tickers is list usually in v3
             mark_price = 0.0
             for t in tickers.get("tickers", []):
                 if t["symbol"].lower() == kf_symbol.lower():
@@ -478,14 +518,11 @@ class Octopus:
             if mark_price == 0: raise ValueError("Mark price 0")
             
             # Convert Target USD to Contracts
-            # NOTE: Check if inverse or linear. 
-            # pf_xbtusd is usually linear (USD collateral). 
-            # If inverse, math is different. Assuming Linear for "pf_" (Perpetual Futures).
-            
             target_contracts = net_target_usd / mark_price
             
-            # Rounding (Kraken rejects high precision)
-            # Most crypto is 0.001 or 0.01 or 1. Let's try 3 decimals.
+            # Rounding for contracts (Kraken rejects high precision on size too)
+            # Assuming 4 decimals for contract size is safe generally, 
+            # but usually size is also subject to lot size.
             target_contracts = round(target_contracts, 4)
             
             # Delta
@@ -519,7 +556,7 @@ class Octopus:
         
         for i in range(decay_steps):
             try:
-                # 1. Get Fresh Mark Price
+                # 1. Get Fresh Mark Price (Read request: lowercase)
                 tickers = self.kf.get_tickers()
                 curr_mark = 0.0
                 for t in tickers.get("tickers", []):
@@ -530,25 +567,26 @@ class Octopus:
                 if curr_mark == 0: curr_mark = initial_mark
                 
                 # 2. Calculate Decay Price
-                # Formula: price * 0.01 * -direction * e^(-i * 0.5)
-                # Direction: Buy=+1, Sell=-1
                 direction = 1 if side == "buy" else -1
                 decay_factor = math.exp(-i * 0.5)
                 offset = curr_mark * 0.01 * -direction * decay_factor
                 
-                limit_price = curr_mark + offset
+                raw_limit_price = curr_mark + offset
                 
-                # Format Price (Tick size is vital, rounding to 2 decimals for USD usually safe)
-                limit_price = round(limit_price, 2)
+                # Format Price respecting Tick Size
+                limit_price = self._format_price(raw_limit_price, symbol)
                 
                 logger.info(f"[{symbol}] Maker Iter {i}: {side.upper()} {abs_qty} @ {limit_price} (Mark: {curr_mark})")
 
                 # 3. Place or Edit
+                # NOTE: Order requests symbol must be ALL CAPS
+                upper_symbol = symbol.upper()
+
                 if order_id is None:
                     # Send New
                     resp = self.kf.send_order({
                         "orderType": "lmt",
-                        "symbol": symbol,
+                        "symbol": upper_symbol, 
                         "side": side,
                         "size": abs_qty,
                         "limitPrice": limit_price
@@ -559,22 +597,19 @@ class Octopus:
                          logger.error(f"[{symbol}] Order fail: {resp}")
                          break # Fatal
                 else:
-                    # Edit
+                    # Edit (edit_order typically uses orderId, but if we sent symbol it would need to be caps)
+                    # We only send orderId, price, size.
                     self.kf.edit_order({
                         "orderId": order_id,
                         "limitPrice": limit_price,
-                        "size": abs_qty # Ensure size is maintained
+                        "size": abs_qty 
                     })
 
                 # 4. Wait & Check Fill
                 time.sleep(30)
                 
-                # Check status
+                # Check status (Read request: lowercase or id based)
                 status = self.kf.get_order(order_id)
-                # Extract fill info... detailed structure varies. 
-                # Assuming check if "status" is "filled".
-                # If not easily parsed, we wait for next iter.
-                # Kraken get_order usually returns list of orders.
                 
             except Exception as e:
                 logger.error(f"[{symbol}] Maker Loop Error: {e}")
