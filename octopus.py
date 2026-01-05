@@ -47,7 +47,7 @@ GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/content
 
 # Asset Mapping (Binance USDT -> Kraken Futures Perpetual)
 SYMBOL_MAP = {
-    "BTCUSDT": "ff_xbtusd_261225",
+    "BTCUSDT": "ff_xbtusd_260327", # Updated as requested
     "ETHUSDT": "pf_ethusd",
     "SOLUSDT": "pf_solusd",
     "BNBUSDT": "pf_bnbusd",
@@ -175,10 +175,14 @@ class Octopus:
         self.price_history: Dict[str, List[Tuple[int, float]]] = defaultdict(list) # Asset -> [(ts, price)]
         self.executor = ThreadPoolExecutor(max_workers=5) # Parallel execution
         self.total_strategies_count = 0
+        self.instrument_specs = {} # Store lotSize and tickSize
 
     # --- Initialization ---
     def initialize(self):
         logger.info("Initializing Octopus...")
+        
+        # 0. Fetch Instrument Specs (Critical for correct sizing)
+        self._fetch_instrument_specs()
         
         # --- STRESS TEST INJECTION ---
         logger.info("Executing Startup Stress Test...")
@@ -197,6 +201,25 @@ class Octopus:
         self._fetch_initial_data()
         self._train_all_strategies()
         logger.info("Initialization Complete. Entering Wait Loop.")
+
+    def _fetch_instrument_specs(self):
+        """Fetches tick size and lot size for all instruments to prevent invalidSize errors."""
+        try:
+            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
+            resp = requests.get(url).json()
+            if "instruments" in resp:
+                for inst in resp["instruments"]:
+                    sym = inst["symbol"].lower()
+                    self.instrument_specs[sym] = {
+                        "lotSize": float(inst.get("lotSize", 1.0)),
+                        "tickSize": float(inst.get("tickSize", 0.1)),
+                        "contractSize": float(inst.get("contractSize", 1.0))
+                    }
+                logger.info(f"Loaded specs for {len(self.instrument_specs)} instruments.")
+            else:
+                logger.error("Failed to load instrument specs (no 'instruments' in response).")
+        except Exception as e:
+            logger.error(f"Error fetching instrument specs: {e}")
 
     def _load_strategies_from_github(self):
         """Downloads all JSON strategy files from the repo."""
@@ -372,14 +395,6 @@ class Octopus:
                     if ts > last_stored_ts:
                         self.price_history[asset].append((ts, price))
                         
-                # Trim list to keep memory sane (last 5000 is plenty)
-                # NOTE: Since we are training on long history, we might want to keep more than 5000 now?
-                # However, for live inference, we likely only need the tail. 
-                # If we re-train periodically, we need all history.
-                # Assuming strategies are trained once at startup, we might not need all history 
-                # UNLESS we re-train regularly. The current logic trains once in `initialize`.
-                # If we want to keep the full history for future features, we can remove the trim or increase it.
-                # I'll increase it to 200,000 to cover the years fetched, just in case logic changes.
                 if len(self.price_history[asset]) > 200000:
                     self.price_history[asset] = self.price_history[asset][-200000:]
                     
@@ -392,14 +407,9 @@ class Octopus:
         # 1. Get Capital
         try:
             acc = self.kf.get_accounts()
-            # Navigate complex structure to find Equity
-            # accounts -> fi_xbtusd -> auxiliary -> pv (Portfolio Value) or marginEquity
-            # Fallback to a simpler key if specific path fails, but 'marginEquity' is standard.
-            # Based on user image: flex -> marginEquity
             if "flex" in acc.get("accounts", {}):
                 equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
             else:
-                # Fallback to first account found
                 first_acc = list(acc.get("accounts", {}).values())[0]
                 equity = float(first_acc.get("marginEquity", 0))
                 
@@ -412,8 +422,6 @@ class Octopus:
             return
 
         # 2. Calculate Unit Size
-        # Formula: Capital * 1 / (Total_Strategies / Leverage)
-        # = (Capital * Leverage) / Total_Strategies
         if self.total_strategies_count == 0: return
         unit_size_usd = (equity * LEVERAGE) / self.total_strategies_count
         logger.info(f"Equity: ${equity:.2f} | Unit Size: ${unit_size_usd:.2f}")
@@ -436,7 +444,6 @@ class Octopus:
                 sig = s.predict(prices) # 1, -1, 0
                 
                 # Update Virtual Position
-                # 1 = Long 1 Unit, -1 = Short 1 Unit, 0 = Flat
                 s.virtual_position = sig * unit_size_usd
                 
                 logger.info(f"Strategy {s.id}: Signal {sig} -> VirtPos ${s.virtual_position:.2f}")
@@ -464,8 +471,6 @@ class Octopus:
         # B. Get Current Position on Kraken
         try:
             open_pos = self.kf.get_open_positions()
-            # Response: {"result": "success", "openPositions": [...]}
-            # Structure usually list of dicts.
             current_pos_size = 0.0
             
             if "openPositions" in open_pos:
@@ -483,7 +488,6 @@ class Octopus:
         # C. Get Market Price for Conversion (USD -> Contracts)
         try:
             tickers = self.kf.get_tickers()
-            # Tickers is list usually in v3
             mark_price = 0.0
             for t in tickers.get("tickers", []):
                 if t["symbol"].lower() == kf_symbol.lower():
@@ -493,16 +497,28 @@ class Octopus:
             if mark_price == 0: raise ValueError("Mark price 0")
             
             # Convert Target USD to Contracts
-            # NOTE: Check if inverse or linear. 
-            # pf_xbtusd is usually linear (USD collateral). 
-            # If inverse, math is different. Assuming Linear for "pf_" (Perpetual Futures).
-            
             target_contracts = net_target_usd / mark_price
             
-            # Rounding (Kraken rejects high precision)
-            # Most crypto is 0.001 or 0.01 or 1. Let's try 3 decimals.
-            target_contracts = round(target_contracts, 4)
-            
+            # --- FIX: Apply Lot Size Rounding ---
+            specs = self.instrument_specs.get(kf_symbol.lower())
+            if specs:
+                lot_size = specs['lotSize']
+                # Round to nearest lot_size
+                target_contracts = round(target_contracts / lot_size) * lot_size
+                # If lot_size is integer (e.g. 1.0), ensure int
+                if lot_size.is_integer():
+                    target_contracts = int(target_contracts)
+                else:
+                    # Determine precision from lot_size (e.g., 0.01 -> 2 decimals)
+                    decimals = 0
+                    if "." in str(lot_size):
+                         decimals = len(str(lot_size).split(".")[1])
+                    target_contracts = round(target_contracts, decimals)
+            else:
+                # Fallback if spec fetch failed
+                target_contracts = round(target_contracts, 3)
+            # ------------------------------------
+
             # Delta
             delta = target_contracts - current_pos_size
             
@@ -545,16 +561,24 @@ class Octopus:
                 if curr_mark == 0: curr_mark = initial_mark
                 
                 # 2. Calculate Decay Price
-                # Formula: price * 0.01 * -direction * e^(-i * 0.5)
-                # Direction: Buy=+1, Sell=-1
                 direction = 1 if side == "buy" else -1
                 decay_factor = math.exp(-i * 0.5)
                 offset = curr_mark * 0.01 * -direction * decay_factor
                 
                 limit_price = curr_mark + offset
                 
-                # Format Price (Tick size is vital, rounding to 2 decimals for USD usually safe)
-                limit_price = round(limit_price, 2)
+                # Format Price (Tick size)
+                # Use cached tick size if available
+                tick_size = 0.01 # default
+                specs = self.instrument_specs.get(symbol.lower())
+                if specs: tick_size = specs['tickSize']
+                
+                limit_price = round(limit_price / tick_size) * tick_size
+                # Precise formatting
+                decimals = 0
+                if "." in str(tick_size):
+                     decimals = len(str(tick_size).split(".")[1])
+                limit_price = round(limit_price, decimals)
                 
                 logger.info(f"[{symbol}] Maker Iter {i}: {side.upper()} {abs_qty} @ {limit_price} (Mark: {curr_mark})")
 
@@ -586,10 +610,7 @@ class Octopus:
                 
                 # Check status
                 status = self.kf.get_order(order_id)
-                # Extract fill info... detailed structure varies. 
-                # Assuming check if "status" is "filled".
-                # If not easily parsed, we wait for next iter.
-                # Kraken get_order usually returns list of orders.
+                # Assuming simple check logic here
                 
             except Exception as e:
                 logger.error(f"[{symbol}] Maker Loop Error: {e}")
