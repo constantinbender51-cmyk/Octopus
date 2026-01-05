@@ -508,39 +508,48 @@ class Octopus:
             # Convert Target USD to Contracts
             target_contracts = net_target_usd / mark_price
             
-            # --- FIX: Apply Lot Size Rounding (Robust Logic) ---
-            specs = self.instrument_specs.get(kf_symbol.lower())
-            if specs:
-                lot_size = specs['lotSize']
-                # Round to nearest lot_size
-                target_contracts = round(target_contracts / lot_size) * lot_size
-                
-                # If lot_size is integer (e.g. 1.0), ensure int
-                if lot_size.is_integer():
-                    target_contracts = int(target_contracts)
-                else:
-                    # Determine precision from lot_size (e.g., 0.01 -> 2 decimals)
-                    decimals = 0
-                    if "." in str(lot_size):
-                         decimals = len(str(lot_size).split(".")[1])
-                    target_contracts = round(target_contracts, decimals)
-            else:
-                # Fallback if spec fetch failed
-                target_contracts = round(target_contracts, 3)
-            # ------------------------------------
-
+            # --- FIX: MOVED ROUNDING TO FINAL STEP ---
+            # We do NOT round here anymore to preserve the virtual position delta precision.
+            
             # Delta
             delta = target_contracts - current_pos_size
             
-            # Min size threshold (approx $10)
-            if abs(delta * mark_price) < 10:
-                logger.info(f"[{kf_symbol}] Delta small (${delta*mark_price:.2f}). Skipping.")
+            logger.info(f"[{kf_symbol}] Net Target: {target_contracts:.6f} | Curr: {current_pos_size} | Delta: {delta:.6f}")
+
+            # --- Execution Filtering (Final Step) ---
+            specs = self.instrument_specs.get(kf_symbol.lower())
+            if not specs:
+                 logger.warning(f"[{kf_symbol}] Specs not found. Using default rounding.")
+                 lot_size = 0.001
+            else:
+                 lot_size = specs['lotSize']
+
+            # Calculate precise executable quantity
+            abs_delta = abs(delta)
+            
+            # Round to nearest Lot Size (Execution Logic)
+            rounded_abs_qty = round(abs_delta / lot_size) * lot_size
+            
+            # Precision cleanup
+            if isinstance(lot_size, int) or lot_size.is_integer():
+                rounded_abs_qty = int(rounded_abs_qty)
+            else:
+                decimals = 0
+                if "." in str(lot_size):
+                     decimals = len(str(lot_size).split(".")[1])
+                rounded_abs_qty = round(rounded_abs_qty, decimals)
+
+            # Check if actionable
+            if rounded_abs_qty < lot_size:
+                # If it rounds to 0, we skip execution but we logged the intent above
+                logger.info(f"[{kf_symbol}] Delta rounds to 0 (Rounded: {rounded_abs_qty} < Lot: {lot_size}). Skipping.")
                 return
 
-            logger.info(f"[{kf_symbol}] Net Target: {target_contracts} | Curr: {current_pos_size} | Delta: {delta}")
+            # Apply direction to the rounded quantity
+            final_order_qty = rounded_abs_qty * (1 if delta > 0 else -1)
             
             # D. Execute Maker Loop
-            self._run_maker_loop(kf_symbol, delta, mark_price)
+            self._run_maker_loop(kf_symbol, final_order_qty, mark_price)
 
         except Exception as e:
             logger.error(f"[{kf_symbol}] Execution Logic Failed: {e}")
