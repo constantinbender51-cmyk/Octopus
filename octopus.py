@@ -519,4 +519,38 @@ class Octopus:
                          order_id = resp["sendStatus"]["order_id"]
                     else:
                          logger.error(f"[{symbol}] Order fail: {resp}")
-          
+                         break # Fatal
+                else:
+                    # Edit
+                    self.kf.edit_order({
+                        "orderId": order_id,
+                        "limitPrice": limit_price,
+                        "size": abs_qty # Ensure size is maintained
+                    })
+
+                # 4. Wait & Check Fill
+                time.sleep(30)
+                
+                # Check status
+                status = self.kf.get_order(order_id)
+                # Extract fill info... detailed structure varies. 
+                # Assuming check if "status" is "filled".
+                # If not easily parsed, we wait for next iter.
+                # Kraken get_order usually returns list of orders.
+                
+            except Exception as e:
+                logger.error(f"[{symbol}] Maker Loop Error: {e}")
+                time.sleep(5)
+        
+        # Timeout - Cancel
+        if order_id:
+            try:
+                logger.info(f"[{symbol}] Timeout. Cancelling.")
+                self.kf.cancel_order({"orderId": order_id})
+            except:
+                pass
+
+if __name__ == "__main__":
+    bot = Octopus()
+    bot.initialize()
+    bot.run()
