@@ -121,17 +121,26 @@ class Strategy:
 
     def predict(self, recent_prices: List[float]) -> int:
         """Returns signal: 1 (Buy), -1 (Sell), 0 (Flat/Neutral)."""
+        # We need seq_len + 1 data points to generate seq_len differences
+        # to match the logic in app.py where it uses a lookback to start the sequence.
         if len(recent_prices) < self.seq_len + 1:
             return 0
             
         buckets = [self._get_bucket(p) for p in recent_prices]
         
-        # Current Context
-        curr_buckets = buckets[-self.seq_len:] # Last N buckets
-        a_seq = tuple(curr_buckets)
-        d_seq = tuple(curr_buckets[j] - curr_buckets[j-1] for j in range(1, len(curr_buckets)))
+        # FIX: Fetch seq_len + 1 buckets to capture the leading derivative
+        # If seq_len is 3, we grab 4 items: [Preceding, A, B, C]
+        window = buckets[-(self.seq_len + 1):] 
         
-        last_val = curr_buckets[-1]
+        # Absolute sequence uses the LAST seq_len items (ignoring the extra old one)
+        # Result: [A, B, C]
+        a_seq = tuple(window[1:]) 
+        
+        # Derivative sequence uses ALL items to create differences
+        # (A-Preceding), (B-A), (C-B) -> Length 3
+        d_seq = tuple(window[j] - window[j-1] for j in range(1, len(window)))
+        
+        last_val = window[-1]
         
         # Get Prediction Target
         pred_bucket = last_val
