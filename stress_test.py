@@ -63,7 +63,6 @@ class StressTester:
         self.log("1. Testing Account API & Fetching Equity...")
         try:
             accounts = self.kf.get_accounts()
-            # self.log(f"Raw Account Data: {json.dumps(accounts)}")
             
             # Extract Margin Equity
             if "accounts" in accounts and "flex" in accounts["accounts"]:
@@ -91,10 +90,9 @@ class StressTester:
             self.log(f"Error fetching open data: {e}")
 
         # 3. Order System Test
-        self.log("3. Testing Order Execution (Place & Cancel) for all symbols...")
+        self.log("3. Testing Order Execution (Place -> Verify -> Edit -> Cancel)...")
         
         # Calculate roughly the size we would use in live trading
-        # (Equity * Leverage) / Count
         strat_count = len(self.symbol_map) # Approximation
         if strat_count == 0: strat_count = 1
         unit_size_usd = (self.equity * self.leverage) / strat_count
@@ -107,6 +105,27 @@ class StressTester:
         self.log("4. Uploading Results to GitHub...")
         self._upload_to_github()
         self.log("--- STRESS TEST COMPLETE ---")
+
+    def _find_order_in_open(self, target_order_id):
+        """Helper to safely find an order in the open orders list."""
+        try:
+            orders_resp = self.kf.get_open_orders()
+            # Handle list vs dict response structure variations
+            orders_list = []
+            if isinstance(orders_resp, dict) and "openOrders" in orders_resp:
+                orders_list = orders_resp["openOrders"]
+            elif isinstance(orders_resp, list):
+                orders_list = orders_resp
+            
+            for o in orders_list:
+                # Key might be 'order_id' or 'orderId' depending on API version
+                oid = o.get("order_id") or o.get("orderId")
+                if oid == target_order_id:
+                    return o
+            return None
+        except Exception as e:
+            self.log(f"Error in _find_order_in_open: {e}")
+            return None
 
     def _test_symbol_execution(self, symbol, usd_size):
         self.log(f"--- Testing {symbol} ---")
@@ -126,39 +145,27 @@ class StressTester:
 
             # B. Calculate Size in Contracts (WITH VALIDATION)
             raw_size = usd_size / mark_price
-            
-            # --- FIX: Apply Lot Size Rounding ---
             specs = self.instrument_specs.get(symbol.lower())
             
             if specs:
                 lot_size = specs['lotSize']
-                # Round to nearest lot_size
                 size = round(raw_size / lot_size) * lot_size
-                
-                # If lot_size is integer (e.g. 1.0), ensure int
                 if lot_size.is_integer():
                     size = int(size)
                 else:
-                    # Determine precision from lot_size
                     decimals = 0
                     if "." in str(lot_size):
                          decimals = len(str(lot_size).split(".")[1])
                     size = round(size, decimals)
-                
-                self.log(f"   Debug: {symbol} LotSize: {lot_size}, Raw: {raw_size:.4f}, Rounded: {size}")
             else:
-                self.log(f"   Warning: No specs for {symbol}, using default rounding.")
                 size = round(raw_size, 3)
-            # ------------------------------------
 
             if size <= 0:
-                self.log(f"SKIPPING: Size {size} is too small/zero.")
+                self.log(f"SKIPPING: {symbol} (Size {size} too small for min lot)")
                 return
 
             # C. Place 'Safe' Limit Order
-            # Place buy limit 50% BELOW market
             safe_limit_price = round(mark_price * 0.5, 2)
-            
             self.log(f"Placing LIMIT BUY {size} @ {safe_limit_price} (Mark: {mark_price})")
             
             order_payload = {
@@ -180,23 +187,58 @@ class StressTester:
                 self.log(f"FAILURE: Order placement failed: {resp}")
                 return
 
-            # D. Verify 'Placed' Status
-            time.sleep(0.5) # Wait for engine
-            check = self.kf.get_order(order_id)
-            found_status = "unknown"
-            if isinstance(check, dict) and "orders" in check:
-                 found_status = check["orders"][0].get("status")
-            elif isinstance(check, list) and len(check) > 0:
-                 found_status = check[0].get("status")
+            # D. Verify 'Placed' Status (Reliable Scan)
+            time.sleep(1.0)
+            found_order = self._find_order_in_open(order_id)
             
-            self.log(f"Verification: Order Status is '{found_status}'")
+            if found_order:
+                self.log(f"Verification SUCCESS: Found order {order_id} in OpenOrders.")
+            else:
+                self.log(f"Verification WARNING: Order {order_id} not found in OpenOrders. (Check logs for errors)")
 
-            # E. Cancel Order ("Close an Order")
-            self.log(f"Cancelling Order {order_id}...")
-            cancel_resp = self.kf.cancel_order({"orderId": order_id})
-            self.log(f"Cancel Response: {cancel_resp}")
+            # E. Test Edit Functionality
+            if found_order:
+                # Move price up by 1% (still very safe)
+                new_price = round(safe_limit_price * 1.01, 2)
+                self.log(f"Testing EDIT: Moving price from {safe_limit_price} to {new_price}...")
+                
+                edit_payload = {
+                    "orderId": order_id,
+                    "limitPrice": new_price,
+                    "size": size,
+                    "symbol": symbol 
+                }
+                
+                edit_resp = self.kf.edit_order(edit_payload)
+                
+                if "editStatus" in edit_resp:
+                    self.log(f"Edit Signal Sent. Status: {edit_resp.get('editStatus')}")
+                else:
+                    self.log(f"Edit Signal Sent. Raw Resp: {edit_resp}")
 
-            # F. Close Position (If exists)
+                # Verify Edit
+                time.sleep(1.0)
+                updated_order = self._find_order_in_open(order_id)
+                if updated_order:
+                    # Kraken might return price as string or float
+                    curr_price = float(updated_order.get("limitPrice", 0))
+                    if abs(curr_price - new_price) < (new_price * 0.001): # 0.1% tolerance
+                        self.log(f"Edit Verification SUCCESS: Price updated to {curr_price}")
+                    else:
+                        self.log(f"Edit Verification FAILED: Price is {curr_price}, expected {new_price}")
+                else:
+                    self.log("Edit Verification FAILED: Order disappeared during edit.")
+
+            # F. Cancel Order
+            if order_id:
+                self.log(f"Cancelling Order {order_id}...")
+                try:
+                    cancel_resp = self.kf.cancel_order({"orderId": order_id})
+                    self.log(f"Cancel Response: {cancel_resp}")
+                except Exception as e:
+                    self.log(f"Cancel Failed: {e}")
+
+            # G. Close Position (Cleanup)
             self._check_and_close_position(symbol)
 
         except Exception as e:
@@ -217,7 +259,6 @@ class StressTester:
             
             if size != 0:
                 self.log(f"Open Position found for {symbol}: {size}. Closing...")
-                # To close, we place a market order in opposite direction
                 side = "sell" if size > 0 else "buy"
                 payload = {
                     "orderType": "mkt",
@@ -228,8 +269,6 @@ class StressTester:
                 }
                 resp = self.kf.send_order(payload)
                 self.log(f"Close Position Response: {resp}")
-            else:
-                self.log(f"No open position for {symbol} to close.")
                 
         except Exception as e:
             self.log(f"Error in Close Position logic: {e}")
@@ -254,7 +293,6 @@ class StressTester:
             "content": content_b64
         }
 
-        # Check if file exists to get SHA (needed for update)
         try:
             get_resp = requests.get(url, headers=headers)
             if get_resp.status_code == 200:
@@ -265,7 +303,6 @@ class StressTester:
         except:
             pass
 
-        # PUT Request
         try:
             put_resp = requests.put(url, headers=headers, json=data)
             if put_resp.status_code in [200, 201]:
