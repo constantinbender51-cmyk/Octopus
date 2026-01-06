@@ -205,8 +205,19 @@ class Octopus:
             if "instruments" in resp:
                 for inst in resp["instruments"]:
                     sym = inst["symbol"].lower()
+                    
+                    # --- FIXED: Derive lotSize from contractValueTradePrecision ---
+                    # The user confirmed 'contractValueTradePrecision' dictates quantity decimals.
+                    precision = inst.get("contractValueTradePrecision")
+                    
+                    if precision is not None:
+                        lot_size = 10 ** (-int(precision))
+                    else:
+                        # Fallback: check for explicit lotSize or default to small value
+                        lot_size = float(inst.get("lotSize", 0.0001))
+                    
                     self.instrument_specs[sym] = {
-                        "lotSize": float(inst.get("lotSize", 1.0)),
+                        "lotSize": lot_size,
                         "tickSize": float(inst.get("tickSize", 0.1)),
                         "contractSize": float(inst.get("contractSize", 1.0))
                     }
@@ -486,8 +497,8 @@ class Octopus:
 
             specs = self.instrument_specs.get(kf_symbol.lower())
             
-            # FIXED: Use lotSize for quantity steps, not tickSize (price steps)
-            size_increment = specs['lotSize'] if specs else 0.001
+            # Use lotSize for quantity steps
+            size_increment = specs['lotSize'] if specs else 0.0001
             check_qty = self._round_to_step(abs(delta), size_increment)
 
             if check_qty < size_increment:
@@ -507,8 +518,8 @@ class Octopus:
         
         specs = self.instrument_specs.get(symbol.lower())
         
-        # FIXED: Swapped logic - lotSize is for size/quantity, tickSize is for price
-        size_increment = specs['lotSize'] if specs else 0.001
+        # Determine steps: lotSize for Quantity, tickSize for Price
+        size_increment = specs['lotSize'] if specs else 0.0001
         price_increment = specs['tickSize'] if specs else 0.01
 
         for i in range(decay_steps):
