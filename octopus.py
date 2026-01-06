@@ -485,7 +485,9 @@ class Octopus:
             logger.info(f"[{kf_symbol}] Net Target: {target_contracts:.6f} | Curr: {current_pos_size} | Delta: {delta:.6f}")
 
             specs = self.instrument_specs.get(kf_symbol.lower())
-            size_increment = specs['tickSize'] if specs else 0.001
+            
+            # FIXED: Use lotSize for quantity steps, not tickSize (price steps)
+            size_increment = specs['lotSize'] if specs else 0.001
             check_qty = self._round_to_step(abs(delta), size_increment)
 
             if check_qty < size_increment:
@@ -504,8 +506,10 @@ class Octopus:
         order_id = None
         
         specs = self.instrument_specs.get(symbol.lower())
-        size_increment = specs['tickSize'] if specs else 0.001
-        price_increment = specs['lotSize'] if specs else 0.01
+        
+        # FIXED: Swapped logic - lotSize is for size/quantity, tickSize is for price
+        size_increment = specs['lotSize'] if specs else 0.001
+        price_increment = specs['tickSize'] if specs else 0.01
 
         for i in range(decay_steps):
             try:
