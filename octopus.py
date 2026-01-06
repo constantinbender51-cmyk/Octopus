@@ -171,10 +171,13 @@ class Strategy:
         else: return 0
 
     def _get_bucket(self, price: float) -> int:
+        bs = self.bucket_size
+        if bs <= 0: bs = 1e-9
+        
         if price >= 0:
-            return (int(price) // self.bucket_size) + 1
+            return int(price // bs)
         else:
-            return (int(price + 1) // self.bucket_size) - 1
+            return int(price // bs) - 1
 
 
 class Octopus:
@@ -195,15 +198,18 @@ class Octopus:
         
         # --- STRESS TEST INJECTION ---
         logger.info("Executing Startup Stress Test...")
-        stress_test.run_stress_test(
-            self.kf, 
-            SYMBOL_MAP, 
-            LEVERAGE, 
-            REPO_OWNER, 
-            REPO_NAME, 
-            GITHUB_PAT
-        )
-        logger.info("Stress Test Completed. Proceeding with Normal Boot.")
+        try:
+            stress_test.run_stress_test(
+                self.kf, 
+                SYMBOL_MAP, 
+                LEVERAGE, 
+                REPO_OWNER, 
+                REPO_NAME, 
+                GITHUB_PAT
+            )
+            logger.info("Stress Test Completed. Proceeding with Normal Boot.")
+        except Exception as e:
+            logger.error(f"Stress test failed or skipped: {e}")
         # -----------------------------
 
         self._load_strategies_from_github()
@@ -250,9 +256,15 @@ class Octopus:
                     data = content_resp.json()
                     
                     # Parse filename: ASSET_TIMEFRAME.json
-                    # But config is inside.
-                    asset = data['asset']
-                    tf = data['timeframe']
+                    asset = data.get('asset')
+                    tf = data.get('timeframe')
+
+                    # --- FILTERING LOGIC ---
+                    acc = data.get('combined_accuracy', 0)
+                    if acc < 60.0:
+                        logger.warning(f"Skipping strategy {asset} {tf} (Accuracy {acc:.2f}% < 60%)")
+                        continue
+                    # -----------------------
                     
                     # Pick best strategy from the union
                     best_strat = data['strategy_union'][0] # Top 1 is best
@@ -262,7 +274,7 @@ class Octopus:
                     count += 1
             
             self.total_strategies_count = count
-            logger.info(f"Loaded {count} strategies from GitHub.")
+            logger.info(f"Loaded {count} strategies from GitHub (Filtered > 60%).")
             
         except Exception as e:
             logger.error(f"Failed to load strategies: {e}")
