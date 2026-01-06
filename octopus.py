@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Octopus: Multi-Strategy Aggregator & Execution Engine for Kraken Futures.
+Updated to use Strategy Union (Voting Consensus) from top configurations.
 """
 
 import os
@@ -75,109 +76,145 @@ logger = logging.getLogger("Octopus")
 
 class Strategy:
     """
-    Represents a single loaded strategy (Asset + Timeframe).
-    Holds the model logic (Probability Maps) and its current Virtual Position.
+    Represents a composite strategy (Asset + Timeframe) containing multiple sub-models (Top 3).
+    Implements voting logic to determine the final signal.
     """
-    def __init__(self, asset: str, timeframe: str, config: dict):
+    def __init__(self, asset: str, timeframe: str, configs: list):
         self.asset = asset
         self.timeframe = timeframe
-        self.config = config
-        self.bucket_size = config['bucket_size']
-        self.seq_len = config['seq_len']
-        self.model_type = config['model_type']
+        self.configs = configs # List of top configs (e.g. top 3)
         
         # State
         self.virtual_position = 0.0  # The position this strategy *wants* to hold
-        self.abs_map = defaultdict(Counter)
-        self.der_map = defaultdict(Counter)
-        self.all_vals = []
-        self.all_changes = []
         
+        # Sub-models container
+        # Each element: { 'config': ..., 'abs_map': ..., 'der_map': ..., 'all_vals': ..., 'all_changes': ... }
+        self.models = [] 
+        for c in configs:
+            self.models.append({
+                'config': c,
+                'abs_map': defaultdict(Counter),
+                'der_map': defaultdict(Counter),
+                'all_vals': [],
+                'all_changes': []
+            })
+            
         # Identity
         self.id = f"{asset}_{timeframe}"
 
     def train(self, prices: List[float]):
-        """Rebuilds the probability maps based on provided historical prices."""
-        buckets = [self._get_bucket(p) for p in prices]
+        """Rebuilds the probability maps for ALL sub-models based on provided historical prices."""
         
-        if len(buckets) < self.seq_len + 10:
-            return # Not enough data
+        for model in self.models:
+            c = model['config']
+            bs = c['bucket_size']
+            sl = c['seq_len']
             
-        self.all_vals = list(set(buckets))
-        self.all_changes = list(set(buckets[j] - buckets[j-1] for j in range(1, len(buckets))))
-        
-        self.abs_map.clear()
-        self.der_map.clear()
-        
-        for i in range(len(buckets) - self.seq_len):
-            a_seq = tuple(buckets[i : i + self.seq_len])
-            a_succ = buckets[i + self.seq_len]
-            self.abs_map[a_seq][a_succ] += 1
+            # 1. Bucketize using this model's specific bucket size
+            buckets = [self._get_bucket(p, bs) for p in prices]
             
-            if i > 0:
-                d_seq = tuple(buckets[j] - buckets[j-1] for j in range(i, i + self.seq_len))
-                d_succ = buckets[i + self.seq_len] - buckets[i + self.seq_len - 1]
-                self.der_map[d_seq][d_succ] += 1
+            if len(buckets) < sl + 10:
+                continue # Not enough data for this specific sub-model
+                
+            model['all_vals'] = list(set(buckets))
+            model['all_changes'] = list(set(buckets[j] - buckets[j-1] for j in range(1, len(buckets))))
+            
+            # Clear maps
+            model['abs_map'].clear()
+            model['der_map'].clear()
+            
+            # Build maps
+            for i in range(len(buckets) - sl):
+                a_seq = tuple(buckets[i : i + sl])
+                a_succ = buckets[i + sl]
+                model['abs_map'][a_seq][a_succ] += 1
+                
+                if i > 0:
+                    d_seq = tuple(buckets[j] - buckets[j-1] for j in range(i, i + sl))
+                    d_succ = buckets[i + sl] - buckets[i + sl - 1]
+                    model['der_map'][d_seq][d_succ] += 1
 
     def predict(self, recent_prices: List[float]) -> int:
-        """Returns signal: 1 (Buy), -1 (Sell), 0 (Flat/Neutral)."""
-        # We need seq_len + 1 data points to generate seq_len differences
-        # to match the logic in app.py where it uses a lookback to start the sequence.
-        if len(recent_prices) < self.seq_len + 1:
-            return 0
+        """
+        Returns signal: 1 (Buy), -1 (Sell), 0 (Flat/Neutral).
+        Uses Consensus Voting:
+        - If any model says UP and another says DOWN -> Neutral (Conflict).
+        - If UP exists and no DOWN -> Buy.
+        - If DOWN exists and no UP -> Sell.
+        """
+        signals = []
+        
+        for model in self.models:
+            c = model['config']
+            bs = c['bucket_size']
+            sl = c['seq_len']
+            m_type = c['model_type']
             
-        buckets = [self._get_bucket(p) for p in recent_prices]
-        
-        # FIX: Fetch seq_len + 1 buckets to capture the leading derivative
-        # If seq_len is 3, we grab 4 items: [Preceding, A, B, C]
-        window = buckets[-(self.seq_len + 1):] 
-        
-        # Absolute sequence uses the LAST seq_len items (ignoring the extra old one)
-        # Result: [A, B, C]
-        a_seq = tuple(window[1:]) 
-        
-        # Derivative sequence uses ALL items to create differences
-        # (A-Preceding), (B-A), (C-B) -> Length 3
-        d_seq = tuple(window[j] - window[j-1] for j in range(1, len(window)))
-        
-        last_val = window[-1]
-        
-        # Get Prediction Target
-        pred_bucket = last_val
-        
-        if self.model_type == "Absolute":
-            if a_seq in self.abs_map:
-                pred_bucket = self.abs_map[a_seq].most_common(1)[0][0]
-        elif self.model_type == "Derivative":
-            if d_seq in self.der_map:
-                change = self.der_map[d_seq].most_common(1)[0][0]
-                pred_bucket = last_val + change
-        elif self.model_type == "Combined":
-            # (Simplified logic for brevity, matching training logic)
-            abs_cand = self.abs_map.get(a_seq, Counter())
-            der_cand = self.der_map.get(d_seq, Counter())
-            poss = set(abs_cand.keys())
-            for c in der_cand.keys(): poss.add(last_val + c)
+            # Need seq_len + 1 data points
+            if len(recent_prices) < sl + 1:
+                signals.append(0)
+                continue
+                
+            buckets = [self._get_bucket(p, bs) for p in recent_prices]
             
-            best, max_s = last_val, -1
-            for v in poss:
-                s = abs_cand[v] + der_cand[v - last_val]
-                if s > max_s: max_s, best = s, v
-            pred_bucket = best
+            # Fetch window for this specific sub-model
+            window = buckets[-(sl + 1):] 
+            
+            # Absolute Sequence
+            a_seq = tuple(window[1:]) 
+            
+            # Derivative Sequence
+            d_seq = tuple(window[j] - window[j-1] for j in range(1, len(window)))
+            
+            last_val = window[-1]
+            pred_bucket = last_val
+            
+            # --- Prediction Logic ---
+            if m_type == "Absolute":
+                if a_seq in model['abs_map']:
+                    pred_bucket = model['abs_map'][a_seq].most_common(1)[0][0]
+            
+            elif m_type == "Derivative":
+                if d_seq in model['der_map']:
+                    change = model['der_map'][d_seq].most_common(1)[0][0]
+                    pred_bucket = last_val + change
+            
+            elif m_type == "Combined":
+                abs_cand = model['abs_map'].get(a_seq, Counter())
+                der_cand = model['der_map'].get(d_seq, Counter())
+                poss = set(abs_cand.keys())
+                for ch in der_cand.keys(): poss.add(last_val + ch)
+                
+                best, max_s = last_val, -1
+                for v in poss:
+                    s = abs_cand[v] + der_cand[v - last_val]
+                    if s > max_s: max_s, best = s, v
+                pred_bucket = best
 
-        # Signal Logic
-        if pred_bucket > last_val: return 1
-        elif pred_bucket < last_val: return -1
-        else: return 0
+            # Determine individual signal
+            if pred_bucket > last_val: signals.append(1)
+            elif pred_bucket < last_val: signals.append(-1)
+            else: signals.append(0)
 
-    def _get_bucket(self, price: float) -> int:
-        bs = self.bucket_size
-        if bs <= 0: bs = 1e-9
+        # --- Consensus Voting ---
+        has_up = 1 in signals
+        has_down = -1 in signals
+        
+        if has_up and has_down:
+            return 0 # Conflict
+        if has_up:
+            return 1
+        if has_down:
+            return -1
+        return 0
+
+    def _get_bucket(self, price: float, size: float) -> int:
+        if size <= 0: size = 1e-9
         
         if price >= 0:
-            return int(price // bs)
+            return int(price // size)
         else:
-            return int(price // bs) - 1
+            return int(price // size) - 1
 
 
 class Octopus:
@@ -266,15 +303,19 @@ class Octopus:
                         continue
                     # -----------------------
                     
-                    # Pick best strategy from the union
-                    best_strat = data['strategy_union'][0] # Top 1 is best
-                    
-                    s = Strategy(asset, tf, best_strat)
+                    # UPDATED: Load ALL top strategies for voting
+                    top_strats = data.get('strategy_union', [])
+                    if not top_strats:
+                        logger.warning(f"No strategy_union found for {asset} {tf}")
+                        continue
+
+                    # Create Strategy with list of configs
+                    s = Strategy(asset, tf, top_strats)
                     self.strategies[s.id] = s
                     count += 1
             
             self.total_strategies_count = count
-            logger.info(f"Loaded {count} strategies from GitHub (Filtered > 60%).")
+            logger.info(f"Loaded {count} composite strategies from GitHub (Filtered > 60%).")
             
         except Exception as e:
             logger.error(f"Failed to load strategies: {e}")
