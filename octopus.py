@@ -351,6 +351,22 @@ class Octopus:
         resampled = df['price'].resample(target).last().dropna()
         return resampled.tolist()
 
+    def _round_to_step(self, value: float, step: float) -> float:
+        """Helper to round a value to the nearest step increment."""
+        if step == 0:
+            return value
+        
+        rounded = round(value / step) * step
+        
+        # Fix floating point precision artifacts (e.g. 300.2000000004)
+        if isinstance(step, float) and "." in str(step):
+            decimals = len(str(step).split(".")[1])
+            rounded = round(rounded, decimals)
+        elif isinstance(step, int) or step.is_integer():
+            rounded = int(rounded)
+            
+        return rounded
+
     # --- Core Loop Logic ---
 
     def run(self):
@@ -508,48 +524,27 @@ class Octopus:
             # Convert Target USD to Contracts
             target_contracts = net_target_usd / mark_price
             
-            # --- FIX: MOVED ROUNDING TO FINAL STEP ---
-            # We do NOT round here anymore to preserve the virtual position delta precision.
-            
             # Delta
             delta = target_contracts - current_pos_size
             
             logger.info(f"[{kf_symbol}] Net Target: {target_contracts:.6f} | Curr: {current_pos_size} | Delta: {delta:.6f}")
 
-            # --- Execution Filtering (Final Step) ---
+            # --- Execution Filtering ---
             specs = self.instrument_specs.get(kf_symbol.lower())
-            if not specs:
-                 logger.warning(f"[{kf_symbol}] Specs not found. Using default rounding.")
-                 lot_size = 0.001
-            else:
-                 lot_size = specs['lotSize']
-
-            # Calculate precise executable quantity
-            abs_delta = abs(delta)
             
-            # Round to nearest Lot Size (Execution Logic)
-            rounded_abs_qty = round(abs_delta / lot_size) * lot_size
-            
-            # Precision cleanup
-            if isinstance(lot_size, int) or lot_size.is_integer():
-                rounded_abs_qty = int(rounded_abs_qty)
-            else:
-                decimals = 0
-                if "." in str(lot_size):
-                     decimals = len(str(lot_size).split(".")[1])
-                rounded_abs_qty = round(rounded_abs_qty, decimals)
+            # Note: User specified Tick Size restricts SIZE, Lot Size restricts PRICE.
+            size_increment = specs['tickSize'] if specs else 0.001
 
-            # Check if actionable
-            if rounded_abs_qty < lot_size:
-                # If it rounds to 0, we skip execution but we logged the intent above
-                logger.info(f"[{kf_symbol}] Delta rounds to 0 (Rounded: {rounded_abs_qty} < Lot: {lot_size}). Skipping.")
+            # Check actionability by rounding locally just for the check
+            check_qty = self._round_to_step(abs(delta), size_increment)
+
+            if check_qty < size_increment:
+                logger.info(f"[{kf_symbol}] Delta rounds to 0 (Rounded: {check_qty} < SizeInc: {size_increment}). Skipping.")
                 return
 
-            # Apply direction to the rounded quantity
-            final_order_qty = rounded_abs_qty * (1 if delta > 0 else -1)
-            
             # D. Execute Maker Loop
-            self._run_maker_loop(kf_symbol, final_order_qty, mark_price)
+            # Pass the RAW delta; explicit rounding happens right before send inside the loop
+            self._run_maker_loop(kf_symbol, delta, mark_price)
 
         except Exception as e:
             logger.error(f"[{kf_symbol}] Execution Logic Failed: {e}")
@@ -557,16 +552,22 @@ class Octopus:
     def _run_maker_loop(self, symbol: str, quantity: float, initial_mark: float):
         """
         Places a limit order and updates it every 30s to chase/decay towards mark.
-        quantity: positive (buy) or negative (sell).
+        quantity: positive (buy) or negative (sell) - RAW (unrounded) quantity.
         """
         side = "buy" if quantity > 0 else "sell"
-        abs_qty = abs(quantity)
+        abs_qty_raw = abs(quantity)
         
         # Initial Offset (e.g., 0.5%)
         decay_steps = 10 # 5 minutes / 30s
         
         order_id = None
         
+        # Specs for Rounding
+        specs = self.instrument_specs.get(symbol.lower())
+        # As per user instruction:
+        size_increment = specs['tickSize'] if specs else 0.001
+        price_increment = specs['lotSize'] if specs else 0.01
+
         for i in range(decay_steps):
             try:
                 # 1. Get Fresh Mark Price
@@ -584,21 +585,13 @@ class Octopus:
                 decay_factor = math.exp(-i * 0.5)
                 offset = curr_mark * 0.01 * -direction * decay_factor
                 
-                limit_price = curr_mark + offset
+                raw_limit_price = curr_mark + offset
                 
-                # Format Price (Tick size)
-                tick_size = 0.01 # default
-                specs = self.instrument_specs.get(symbol.lower())
-                if specs: tick_size = specs['tickSize']
+                # --- ROUNDING (Right before send) ---
+                final_limit_price = self._round_to_step(raw_limit_price, price_increment)
+                final_size = self._round_to_step(abs_qty_raw, size_increment)
                 
-                limit_price = round(limit_price / tick_size) * tick_size
-                # Precise formatting
-                decimals = 0
-                if "." in str(tick_size):
-                     decimals = len(str(tick_size).split(".")[1])
-                limit_price = round(limit_price, decimals)
-                
-                logger.info(f"[{symbol}] Maker Iter {i}: {side.upper()} {abs_qty} @ {limit_price} (Mark: {curr_mark})")
+                logger.info(f"[{symbol}] Maker Iter {i}: {side.upper()} {final_size} @ {final_limit_price} (Mark: {curr_mark})")
 
                 # 3. Place or Edit
                 if order_id is None:
@@ -607,8 +600,8 @@ class Octopus:
                         "orderType": "lmt",
                         "symbol": symbol,
                         "side": side,
-                        "size": abs_qty,
-                        "limitPrice": limit_price
+                        "size": final_size,
+                        "limitPrice": final_limit_price
                     })
                     if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                          order_id = resp["sendStatus"]["order_id"]
@@ -616,20 +609,16 @@ class Octopus:
                          logger.error(f"[{symbol}] Order fail: {resp}")
                          break # Fatal
                 else:
-                    # Edit - Updated payload based on stress_test
+                    # Edit
                     self.kf.edit_order({
                         "orderId": order_id,
-                        "limitPrice": limit_price,
-                        "size": abs_qty,
+                        "limitPrice": final_limit_price,
+                        "size": final_size,
                         "symbol": symbol 
                     })
 
                 # 4. Wait
                 time.sleep(30)
-                
-                # Note: We do NOT verify status here anymore, as get_order 
-                # proved unreliable in stress tests. We assume order is open.
-                # If filled, edit might fail silently or we catch exception.
                 
             except Exception as e:
                 logger.error(f"[{symbol}] Maker Loop Error: {e}")
@@ -640,7 +629,6 @@ class Octopus:
             try:
                 logger.info(f"[{symbol}] Timeout. Cancelling.")
                 
-                # Updated Cancel Payload (Required Args)
                 process_before = (datetime.now(timezone.utc) + timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
                 self.kf.cancel_order({
                     "order_id": order_id,
