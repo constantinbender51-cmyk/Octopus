@@ -207,7 +207,6 @@ class Octopus:
                     sym = inst["symbol"].lower()
                     
                     # --- FIXED: Derive lotSize from contractValueTradePrecision ---
-                    # The user confirmed 'contractValueTradePrecision' dictates quantity decimals.
                     precision = inst.get("contractValueTradePrecision")
                     
                     if precision is not None:
@@ -412,17 +411,44 @@ class Octopus:
         for asset in active_assets:
             try:
                 url = "https://api.binance.com/api/v3/klines"
-                params = {"symbol": asset, "interval": "15m", "limit": 5} 
+                # Fetch slightly more to ensure overlap, and we will strip the last one
+                params = {"symbol": asset, "interval": "15m", "limit": 10} 
                 r = requests.get(url, params=params)
                 data = r.json()
-                last_stored_ts = self.price_history[asset][-1][0]
-                for candle in data:
+                
+                if not data: continue
+                
+                # --- CRITICAL FIX: STRIP UNFINISHED CANDLE ---
+                # Binance returns the current (open) candle as the last element.
+                # We must remove it to avoid data corruption.
+                closed_data = data[:-1]
+                
+                if not closed_data: continue
+
+                # Get the last timestamp we currently have
+                current_history = self.price_history[asset]
+                
+                # If history is empty (first load failed?), just fill it
+                if not current_history:
+                     self.price_history[asset] = [(int(x[6]), float(x[4])) for x in closed_data]
+                     continue
+
+                last_stored_ts = current_history[-1][0]
+                
+                for candle in closed_data:
                     ts = int(candle[6])
                     price = float(candle[4])
+                    
                     if ts > last_stored_ts:
+                        # Append new closed candle
                         self.price_history[asset].append((ts, price))
+                    elif ts == last_stored_ts:
+                        # Update existing candle (handle partials or corrections)
+                        self.price_history[asset][-1] = (ts, price)
+                
                 if len(self.price_history[asset]) > 200000:
                     self.price_history[asset] = self.price_history[asset][-200000:]
+                    
             except Exception as e:
                 logger.error(f"Update failed for {asset}: {e}")
 
