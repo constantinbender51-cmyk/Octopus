@@ -122,22 +122,18 @@ class Strategy:
     def predict(self, recent_prices: List[float]) -> int:
         """Returns signal: 1 (Buy), -1 (Sell), 0 (Flat/Neutral)."""
         # We need seq_len + 1 data points to generate seq_len differences
-        # to match the logic in app.py where it uses a lookback to start the sequence.
         if len(recent_prices) < self.seq_len + 1:
             return 0
             
         buckets = [self._get_bucket(p) for p in recent_prices]
         
-        # FIX: Fetch seq_len + 1 buckets to capture the leading derivative
-        # If seq_len is 3, we grab 4 items: [Preceding, A, B, C]
+        # Fetch seq_len + 1 buckets to capture the leading derivative
         window = buckets[-(self.seq_len + 1):] 
         
-        # Absolute sequence uses the LAST seq_len items (ignoring the extra old one)
-        # Result: [A, B, C]
+        # Absolute sequence uses the LAST seq_len items
         a_seq = tuple(window[1:]) 
         
         # Derivative sequence uses ALL items to create differences
-        # (A-Preceding), (B-A), (C-B) -> Length 3
         d_seq = tuple(window[j] - window[j-1] for j in range(1, len(window)))
         
         last_val = window[-1]
@@ -153,7 +149,6 @@ class Strategy:
                 change = self.der_map[d_seq].most_common(1)[0][0]
                 pred_bucket = last_val + change
         elif self.model_type == "Combined":
-            # (Simplified logic for brevity, matching training logic)
             abs_cand = self.abs_map.get(a_seq, Counter())
             der_cand = self.der_map.get(d_seq, Counter())
             poss = set(abs_cand.keys())
@@ -187,7 +182,7 @@ class Octopus:
         self.price_history: Dict[str, List[Tuple[int, float]]] = defaultdict(list) # Asset -> [(ts, price)]
         self.executor = ThreadPoolExecutor(max_workers=5) # Parallel execution
         self.total_strategies_count = 0
-        self.instrument_specs = {} # Store lotSize and tickSize
+        self.instrument_specs = {} # Store sizeStep and tickSize
 
     # --- Initialization ---
     def initialize(self):
@@ -218,16 +213,28 @@ class Octopus:
         logger.info("Initialization Complete. Entering Wait Loop.")
 
     def _fetch_instrument_specs(self):
-        """Fetches tick size and lot size for all instruments to prevent invalidSize errors."""
+        """Fetches tick size and precision for all instruments."""
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             resp = requests.get(url).json()
             if "instruments" in resp:
                 for inst in resp["instruments"]:
                     sym = inst["symbol"].lower()
+                    
+                    # Logic 1: Tick Size is for Price
+                    tick_size = float(inst.get("tickSize", 0.1))
+                    
+                    # Logic 2: Size Step comes from contractValueTradePrecision
+                    # E.g., precision 3 -> step 0.001
+                    precision = inst.get("contractValueTradePrecision")
+                    if precision is not None:
+                        size_step = 10 ** (-int(precision))
+                    else:
+                        size_step = 1.0 # Default if missing
+                    
                     self.instrument_specs[sym] = {
-                        "lotSize": float(inst.get("lotSize", 1.0)),
-                        "tickSize": float(inst.get("tickSize", 0.1)),
+                        "sizeStep": size_step,
+                        "tickSize": tick_size,
                         "contractSize": float(inst.get("contractSize", 1.0))
                     }
                 logger.info(f"Loaded specs for {len(self.instrument_specs)} instruments.")
@@ -415,22 +422,35 @@ class Octopus:
             time.sleep(1)
 
     def _update_all_data(self):
-        """Fetches just the last few candles to append."""
+        """Fetches just the last few candles to append, IGNORING unfinished current 15m candle."""
+        
+        # Calculate the start time of the current 15m interval
+        now = datetime.now(timezone.utc)
+        current_interval_start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+        limit_ts = int(current_interval_start.timestamp() * 1000)
+
         active_assets = set(s.asset for s in self.strategies.values())
         for asset in active_assets:
             try:
                 url = "https://api.binance.com/api/v3/klines"
+                # Fetch a few extra to be safe
                 params = {"symbol": asset, "interval": "15m", "limit": 5} 
                 r = requests.get(url, params=params)
                 data = r.json()
                 
-                # Append new ones if timestamp > last stored
+                # Append new ones if timestamp > last stored AND candle is finished
                 last_stored_ts = self.price_history[asset][-1][0]
+                
                 for candle in data:
-                    ts = int(candle[6])
+                    open_ts = int(candle[0])
+                    close_ts = int(candle[6])
                     price = float(candle[4])
-                    if ts > last_stored_ts:
-                        self.price_history[asset].append((ts, price))
+                    
+                    # Logic: 
+                    # 1. Must be newer than what we have
+                    # 2. Open Time must be BEFORE the current active interval (i.e. finished)
+                    if close_ts > last_stored_ts and open_ts < limit_ts:
+                        self.price_history[asset].append((close_ts, price))
                         
                 if len(self.price_history[asset]) > 200000:
                     self.price_history[asset] = self.price_history[asset][-200000:]
@@ -544,8 +564,10 @@ class Octopus:
             # --- Execution Filtering ---
             specs = self.instrument_specs.get(kf_symbol.lower())
             
-            # Note: User specified Tick Size restricts SIZE, Lot Size restricts PRICE.
-            size_increment = specs['tickSize'] if specs else 0.001
+            # Logic Update:
+            # Price Increment = tickSize
+            # Size Increment = sizeStep (from contractValueTradePrecision)
+            size_increment = specs['sizeStep'] if specs else 0.001
 
             # Check actionability by rounding locally just for the check
             check_qty = self._round_to_step(abs(delta), size_increment)
@@ -576,9 +598,12 @@ class Octopus:
         
         # Specs for Rounding
         specs = self.instrument_specs.get(symbol.lower())
-        # As per user instruction:
-        size_increment = specs['tickSize'] if specs else 0.001
-        price_increment = specs['lotSize'] if specs else 0.01
+        
+        # Logic Update:
+        # Size (Quantity) -> Rounded by sizeStep (derived from contractValueTradePrecision)
+        # Price -> Rounded by tickSize
+        size_increment = specs['sizeStep'] if specs else 0.001
+        price_increment = specs['tickSize'] if specs else 0.01
 
         for i in range(decay_steps):
             try:
