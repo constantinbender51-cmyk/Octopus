@@ -8,6 +8,7 @@ Updated to match 'Strategy Union' & 'Majority Vote' logic from Generator v58.
 - Precise Timing (Execute at XX:XX:05).
 - Dynamic Execution Window (Sprinter vs Marathoner).
 - NO Retraining during live run.
+- LOGGING: Enhanced decision logging.
 """
 
 import os
@@ -235,13 +236,21 @@ class EnsembleStrategy:
         # Majority Vote Logic
         up_votes = votes.count(1)
         down_votes = votes.count(-1)
+        flat_votes = votes.count(0)
         
+        signal = 0
         if up_votes > down_votes:
-            return 1
+            signal = 1
         elif down_votes > up_votes:
-            return -1
+            signal = -1
         else:
-            return 0
+            signal = 0
+
+        # --- LOG DECISION ---
+        # Only log if there's a significant divergence or for general tracking
+        logger.info(f"[{self.id}] Decision: +{up_votes} / -{down_votes} / ={flat_votes} => Signal: {signal}")
+        
+        return signal
 
 # --- Main Octopus Engine ---
 
@@ -509,7 +518,9 @@ class Octopus:
                 # NOTE: NO RETRAINING HERE. Using initialized maps.
                 sig = strat.predict(prices)
                 strat.virtual_position = sig * unit_size_usd
-                # logger.info(f"Strat {strat.id}: Sig {sig}")
+                
+                # Log outcome for this strategy
+                logger.info(f"Strat {strat.id}: Signal {sig} | Alloc: ${strat.virtual_position:.2f}")
 
         # Run signal calcs
         f_sigs = [self.executor.submit(calc_signal, s) for s in self.strategies.values()]
@@ -568,6 +579,7 @@ class Octopus:
             check_qty = self._round_to_step(abs(delta), size_increment)
 
             if check_qty < size_increment: 
+                logger.info(f"[{kf_symbol}] Delta {delta:.4f} too small (Min: {size_increment}). Holding.")
                 return
 
             logger.info(f"[{kf_symbol}] Executing Delta: {delta:.4f} (Target: ${net_target_usd:.2f})")
@@ -656,7 +668,7 @@ class Octopus:
                         "orderId": order_id, "limitPrice": final_limit,
                         "size": final_size, "symbol": symbol 
                     })
-                    # logger.info(f"[{symbol}] Adjusted @ {final_limit} ({current_aggression_bp}bp)")
+                    logger.info(f"[{symbol}] Adjusted @ {final_limit} ({current_aggression_bp}bp)")
                 
                 time.sleep(interval)
                 
