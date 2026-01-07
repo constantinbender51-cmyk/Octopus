@@ -4,6 +4,8 @@ Octopus: Multi-Strategy Aggregator & Execution Engine for Kraken Futures.
 Updated to match 'Strategy Union' & 'Majority Vote' logic from Generator v58.
 - Uses Fixed Bucket Size from JSON.
 - Trains on 70% of history (matching optimizer split).
+- SEQUENTIAL EXECUTION (No Threading) for easier debugging.
+- Enhanced Logging for Order Status and Logic Gates.
 """
 
 import os
@@ -20,7 +22,7 @@ import numpy as np
 import random
 from datetime import datetime, timezone, timedelta
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+# ThreadPoolExecutor REMOVED for sequential debugging
 from typing import Dict, List, Tuple, Any, Optional
 
 # --- Local Imports ---
@@ -249,7 +251,7 @@ class Octopus:
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
         self.strategies: Dict[str, EnsembleStrategy] = {}
         self.price_history: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
-        self.executor = ThreadPoolExecutor(max_workers=5)
+        # Executor removed for sequential debugging
         self.total_strategies_count = 0
         self.instrument_specs = {}
 
@@ -466,8 +468,9 @@ class Octopus:
                 s.virtual_position = sig * unit_size_usd
                 logger.info(f"Strat {s.id}: Sig {sig} -> Pos ${s.virtual_position:.2f}")
 
+        # SEQUENTIAL EXECUTION for better logging and debugging
         for asset in active_assets:
-            self.executor.submit(self._execute_asset_logic, asset)
+            self._execute_asset_logic(asset)
 
     def _execute_asset_logic(self, binance_asset: str):
         kf_symbol = SYMBOL_MAP.get(binance_asset)
@@ -485,6 +488,8 @@ class Octopus:
                         if p["side"] == "short": size = -size
                         current_pos_size = size
                         break
+            
+            logger.info(f"[{kf_symbol}] Logic Triggered. Net Target: ${net_target_usd:.2f} | Current Pos: {current_pos_size}")
 
             tickers = self.kf.get_tickers()
             mark_price = 0.0
@@ -493,16 +498,24 @@ class Octopus:
                     mark_price = float(t["markPrice"])
                     break
             
-            if mark_price == 0: return
+            if mark_price == 0: 
+                logger.error(f"[{kf_symbol}] Mark price is 0. Aborting.")
+                return
             
             target_contracts = net_target_usd / mark_price
             delta = target_contracts - current_pos_size
+            
+            logger.info(f"[{kf_symbol}] Mark: {mark_price} | Target Contracts: {target_contracts:.4f} | Delta: {delta:.4f}")
             
             specs = self.instrument_specs.get(kf_symbol.lower())
             size_increment = specs['sizeStep'] if specs else 0.001
             check_qty = self._round_to_step(abs(delta), size_increment)
 
-            if check_qty < size_increment: return
+            logger.info(f"[{kf_symbol}] Check Qty: {check_qty} | Min Step: {size_increment}")
+
+            if check_qty < size_increment: 
+                logger.info(f"[{kf_symbol}] Delta too small. Skipping.")
+                return
 
             self._run_maker_loop(kf_symbol, delta, mark_price)
 
@@ -537,24 +550,34 @@ class Octopus:
                 final_size = self._round_to_step(abs_qty, size_inc)
                 
                 if order_id is None:
+                    logger.info(f"[{symbol}] Placing {side.upper()} {final_size} @ {final_limit}...")
                     resp = self.kf.send_order({
                         "orderType": "lmt", "symbol": symbol, "side": side,
                         "size": final_size, "limitPrice": final_limit
                     })
+                    logger.info(f"[{symbol}] Order Response: {resp}")
+                    
                     if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                          order_id = resp["sendStatus"]["order_id"]
-                    else: break
+                    else: 
+                        logger.warning(f"[{symbol}] Order failed or no ID returned.")
+                        break
                 else:
-                    self.kf.edit_order({
+                    logger.info(f"[{symbol}] Editing Order {order_id} to {final_limit}...")
+                    edit_resp = self.kf.edit_order({
                         "orderId": order_id, "limitPrice": final_limit,
                         "size": final_size, "symbol": symbol 
                     })
+                    logger.info(f"[{symbol}] Edit Response: {edit_resp}")
+                    
                 time.sleep(30)
-            except Exception:
+            except Exception as e:
+                logger.error(f"[{symbol}] Maker Loop Error: {e}")
                 time.sleep(5)
         
         if order_id:
             try:
+                logger.info(f"[{symbol}] Cancelling Order {order_id}...")
                 pb = (datetime.now(timezone.utc) + timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
                 self.kf.cancel_order({"order_id": order_id, "symbol": symbol, "processBefore": pb})
             except: pass
