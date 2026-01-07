@@ -122,18 +122,22 @@ class Strategy:
     def predict(self, recent_prices: List[float]) -> int:
         """Returns signal: 1 (Buy), -1 (Sell), 0 (Flat/Neutral)."""
         # We need seq_len + 1 data points to generate seq_len differences
+        # to match the logic in app.py where it uses a lookback to start the sequence.
         if len(recent_prices) < self.seq_len + 1:
             return 0
             
         buckets = [self._get_bucket(p) for p in recent_prices]
         
-        # Fetch seq_len + 1 buckets to capture the leading derivative
+        # FIX: Fetch seq_len + 1 buckets to capture the leading derivative
+        # If seq_len is 3, we grab 4 items: [Preceding, A, B, C]
         window = buckets[-(self.seq_len + 1):] 
         
-        # Absolute sequence uses the LAST seq_len items
+        # Absolute sequence uses the LAST seq_len items (ignoring the extra old one)
+        # Result: [A, B, C]
         a_seq = tuple(window[1:]) 
         
         # Derivative sequence uses ALL items to create differences
+        # (A-Preceding), (B-A), (C-B) -> Length 3
         d_seq = tuple(window[j] - window[j-1] for j in range(1, len(window)))
         
         last_val = window[-1]
@@ -149,6 +153,7 @@ class Strategy:
                 change = self.der_map[d_seq].most_common(1)[0][0]
                 pred_bucket = last_val + change
         elif self.model_type == "Combined":
+            # (Simplified logic for brevity, matching training logic)
             abs_cand = self.abs_map.get(a_seq, Counter())
             der_cand = self.der_map.get(d_seq, Counter())
             poss = set(abs_cand.keys())
@@ -166,13 +171,10 @@ class Strategy:
         else: return 0
 
     def _get_bucket(self, price: float) -> int:
-        bs = self.bucket_size
-        if bs <= 0: bs = 1e-9
-        
         if price >= 0:
-            return int(price // bs)
+            return (int(price) // self.bucket_size) + 1
         else:
-            return int(price // bs) - 1
+            return (int(price + 1) // self.bucket_size) - 1
 
 
 class Octopus:
@@ -182,7 +184,7 @@ class Octopus:
         self.price_history: Dict[str, List[Tuple[int, float]]] = defaultdict(list) # Asset -> [(ts, price)]
         self.executor = ThreadPoolExecutor(max_workers=5) # Parallel execution
         self.total_strategies_count = 0
-        self.instrument_specs = {} # Store sizeStep and tickSize
+        self.instrument_specs = {} # Store lotSize and tickSize
 
     # --- Initialization ---
     def initialize(self):
@@ -193,18 +195,15 @@ class Octopus:
         
         # --- STRESS TEST INJECTION ---
         logger.info("Executing Startup Stress Test...")
-        try:
-            stress_test.run_stress_test(
-                self.kf, 
-                SYMBOL_MAP, 
-                LEVERAGE, 
-                REPO_OWNER, 
-                REPO_NAME, 
-                GITHUB_PAT
-            )
-            logger.info("Stress Test Completed. Proceeding with Normal Boot.")
-        except Exception as e:
-            logger.error(f"Stress test failed or skipped: {e}")
+        stress_test.run_stress_test(
+            self.kf, 
+            SYMBOL_MAP, 
+            LEVERAGE, 
+            REPO_OWNER, 
+            REPO_NAME, 
+            GITHUB_PAT
+        )
+        logger.info("Stress Test Completed. Proceeding with Normal Boot.")
         # -----------------------------
 
         self._load_strategies_from_github()
@@ -213,28 +212,16 @@ class Octopus:
         logger.info("Initialization Complete. Entering Wait Loop.")
 
     def _fetch_instrument_specs(self):
-        """Fetches tick size and precision for all instruments."""
+        """Fetches tick size and lot size for all instruments to prevent invalidSize errors."""
         try:
             url = "https://futures.kraken.com/derivatives/api/v3/instruments"
             resp = requests.get(url).json()
             if "instruments" in resp:
                 for inst in resp["instruments"]:
                     sym = inst["symbol"].lower()
-                    
-                    # Logic 1: Tick Size is for Price
-                    tick_size = float(inst.get("tickSize", 0.1))
-                    
-                    # Logic 2: Size Step comes from contractValueTradePrecision
-                    # E.g., precision 3 -> step 0.001
-                    precision = inst.get("contractValueTradePrecision")
-                    if precision is not None:
-                        size_step = 10 ** (-int(precision))
-                    else:
-                        size_step = 1.0 # Default if missing
-                    
                     self.instrument_specs[sym] = {
-                        "sizeStep": size_step,
-                        "tickSize": tick_size,
+                        "lotSize": float(inst.get("lotSize", 1.0)),
+                        "tickSize": float(inst.get("tickSize", 0.1)),
                         "contractSize": float(inst.get("contractSize", 1.0))
                     }
                 logger.info(f"Loaded specs for {len(self.instrument_specs)} instruments.")
@@ -263,15 +250,9 @@ class Octopus:
                     data = content_resp.json()
                     
                     # Parse filename: ASSET_TIMEFRAME.json
-                    asset = data.get('asset')
-                    tf = data.get('timeframe')
-
-                    # --- FILTERING LOGIC ---
-                    acc = data.get('combined_accuracy', 0)
-                    if acc < 60.0:
-                        logger.warning(f"Skipping strategy {asset} {tf} (Accuracy {acc:.2f}% < 60%)")
-                        continue
-                    # -----------------------
+                    # But config is inside.
+                    asset = data['asset']
+                    tf = data['timeframe']
                     
                     # Pick best strategy from the union
                     best_strat = data['strategy_union'][0] # Top 1 is best
@@ -281,7 +262,7 @@ class Octopus:
                     count += 1
             
             self.total_strategies_count = count
-            logger.info(f"Loaded {count} strategies from GitHub (Filtered > 60%).")
+            logger.info(f"Loaded {count} strategies from GitHub.")
             
         except Exception as e:
             logger.error(f"Failed to load strategies: {e}")
@@ -370,22 +351,6 @@ class Octopus:
         resampled = df['price'].resample(target).last().dropna()
         return resampled.tolist()
 
-    def _round_to_step(self, value: float, step: float) -> float:
-        """Helper to round a value to the nearest step increment."""
-        if step == 0:
-            return value
-        
-        rounded = round(value / step) * step
-        
-        # Fix floating point precision artifacts (e.g. 300.2000000004)
-        if isinstance(step, float) and "." in str(step):
-            decimals = len(str(step).split(".")[1])
-            rounded = round(rounded, decimals)
-        elif isinstance(step, int) or step.is_integer():
-            rounded = int(rounded)
-            
-        return rounded
-
     # --- Core Loop Logic ---
 
     def run(self):
@@ -422,35 +387,22 @@ class Octopus:
             time.sleep(1)
 
     def _update_all_data(self):
-        """Fetches just the last few candles to append, IGNORING unfinished current 15m candle."""
-        
-        # Calculate the start time of the current 15m interval
-        now = datetime.now(timezone.utc)
-        current_interval_start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
-        limit_ts = int(current_interval_start.timestamp() * 1000)
-
+        """Fetches just the last few candles to append."""
         active_assets = set(s.asset for s in self.strategies.values())
         for asset in active_assets:
             try:
                 url = "https://api.binance.com/api/v3/klines"
-                # Fetch a few extra to be safe
                 params = {"symbol": asset, "interval": "15m", "limit": 5} 
                 r = requests.get(url, params=params)
                 data = r.json()
                 
-                # Append new ones if timestamp > last stored AND candle is finished
+                # Append new ones if timestamp > last stored
                 last_stored_ts = self.price_history[asset][-1][0]
-                
                 for candle in data:
-                    open_ts = int(candle[0])
-                    close_ts = int(candle[6])
+                    ts = int(candle[6])
                     price = float(candle[4])
-                    
-                    # Logic: 
-                    # 1. Must be newer than what we have
-                    # 2. Open Time must be BEFORE the current active interval (i.e. finished)
-                    if close_ts > last_stored_ts and open_ts < limit_ts:
-                        self.price_history[asset].append((close_ts, price))
+                    if ts > last_stored_ts:
+                        self.price_history[asset].append((ts, price))
                         
                 if len(self.price_history[asset]) > 200000:
                     self.price_history[asset] = self.price_history[asset][-200000:]
@@ -556,28 +508,38 @@ class Octopus:
             # Convert Target USD to Contracts
             target_contracts = net_target_usd / mark_price
             
+            # --- FIX: Apply Lot Size Rounding (Robust Logic) ---
+            specs = self.instrument_specs.get(kf_symbol.lower())
+            if specs:
+                lot_size = specs['lotSize']
+                # Round to nearest lot_size
+                target_contracts = round(target_contracts / lot_size) * lot_size
+                
+                # If lot_size is integer (e.g. 1.0), ensure int
+                if lot_size.is_integer():
+                    target_contracts = int(target_contracts)
+                else:
+                    # Determine precision from lot_size (e.g., 0.01 -> 2 decimals)
+                    decimals = 0
+                    if "." in str(lot_size):
+                         decimals = len(str(lot_size).split(".")[1])
+                    target_contracts = round(target_contracts, decimals)
+            else:
+                # Fallback if spec fetch failed
+                target_contracts = round(target_contracts, 3)
+            # ------------------------------------
+
             # Delta
             delta = target_contracts - current_pos_size
             
-            logger.info(f"[{kf_symbol}] Net Target: {target_contracts:.6f} | Curr: {current_pos_size} | Delta: {delta:.6f}")
-
-            # --- Execution Filtering ---
-            specs = self.instrument_specs.get(kf_symbol.lower())
-            
-            # Logic Update:
-            # Price Increment = tickSize
-            # Size Increment = sizeStep (from contractValueTradePrecision)
-            size_increment = specs['sizeStep'] if specs else 0.001
-
-            # Check actionability by rounding locally just for the check
-            check_qty = self._round_to_step(abs(delta), size_increment)
-
-            if check_qty < size_increment:
-                logger.info(f"[{kf_symbol}] Delta rounds to 0 (Rounded: {check_qty} < SizeInc: {size_increment}). Skipping.")
+            # Min size threshold (approx $10)
+            if abs(delta * mark_price) < 10:
+                logger.info(f"[{kf_symbol}] Delta small (${delta*mark_price:.2f}). Skipping.")
                 return
 
+            logger.info(f"[{kf_symbol}] Net Target: {target_contracts} | Curr: {current_pos_size} | Delta: {delta}")
+            
             # D. Execute Maker Loop
-            # Pass the RAW delta; explicit rounding happens right before send inside the loop
             self._run_maker_loop(kf_symbol, delta, mark_price)
 
         except Exception as e:
@@ -586,25 +548,16 @@ class Octopus:
     def _run_maker_loop(self, symbol: str, quantity: float, initial_mark: float):
         """
         Places a limit order and updates it every 30s to chase/decay towards mark.
-        quantity: positive (buy) or negative (sell) - RAW (unrounded) quantity.
+        quantity: positive (buy) or negative (sell).
         """
         side = "buy" if quantity > 0 else "sell"
-        abs_qty_raw = abs(quantity)
+        abs_qty = abs(quantity)
         
         # Initial Offset (e.g., 0.5%)
         decay_steps = 10 # 5 minutes / 30s
         
         order_id = None
         
-        # Specs for Rounding
-        specs = self.instrument_specs.get(symbol.lower())
-        
-        # Logic Update:
-        # Size (Quantity) -> Rounded by sizeStep (derived from contractValueTradePrecision)
-        # Price -> Rounded by tickSize
-        size_increment = specs['sizeStep'] if specs else 0.001
-        price_increment = specs['tickSize'] if specs else 0.01
-
         for i in range(decay_steps):
             try:
                 # 1. Get Fresh Mark Price
@@ -622,13 +575,21 @@ class Octopus:
                 decay_factor = math.exp(-i * 0.5)
                 offset = curr_mark * 0.01 * -direction * decay_factor
                 
-                raw_limit_price = curr_mark + offset
+                limit_price = curr_mark + offset
                 
-                # --- ROUNDING (Right before send) ---
-                final_limit_price = self._round_to_step(raw_limit_price, price_increment)
-                final_size = self._round_to_step(abs_qty_raw, size_increment)
+                # Format Price (Tick size)
+                tick_size = 0.01 # default
+                specs = self.instrument_specs.get(symbol.lower())
+                if specs: tick_size = specs['tickSize']
                 
-                logger.info(f"[{symbol}] Maker Iter {i}: {side.upper()} {final_size} @ {final_limit_price} (Mark: {curr_mark})")
+                limit_price = round(limit_price / tick_size) * tick_size
+                # Precise formatting
+                decimals = 0
+                if "." in str(tick_size):
+                     decimals = len(str(tick_size).split(".")[1])
+                limit_price = round(limit_price, decimals)
+                
+                logger.info(f"[{symbol}] Maker Iter {i}: {side.upper()} {abs_qty} @ {limit_price} (Mark: {curr_mark})")
 
                 # 3. Place or Edit
                 if order_id is None:
@@ -637,8 +598,8 @@ class Octopus:
                         "orderType": "lmt",
                         "symbol": symbol,
                         "side": side,
-                        "size": final_size,
-                        "limitPrice": final_limit_price
+                        "size": abs_qty,
+                        "limitPrice": limit_price
                     })
                     if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                          order_id = resp["sendStatus"]["order_id"]
@@ -646,16 +607,20 @@ class Octopus:
                          logger.error(f"[{symbol}] Order fail: {resp}")
                          break # Fatal
                 else:
-                    # Edit
+                    # Edit - Updated payload based on stress_test
                     self.kf.edit_order({
                         "orderId": order_id,
-                        "limitPrice": final_limit_price,
-                        "size": final_size,
+                        "limitPrice": limit_price,
+                        "size": abs_qty,
                         "symbol": symbol 
                     })
 
                 # 4. Wait
                 time.sleep(30)
+                
+                # Note: We do NOT verify status here anymore, as get_order 
+                # proved unreliable in stress tests. We assume order is open.
+                # If filled, edit might fail silently or we catch exception.
                 
             except Exception as e:
                 logger.error(f"[{symbol}] Maker Loop Error: {e}")
@@ -666,6 +631,7 @@ class Octopus:
             try:
                 logger.info(f"[{symbol}] Timeout. Cancelling.")
                 
+                # Updated Cancel Payload (Required Args)
                 process_before = (datetime.now(timezone.utc) + timedelta(seconds=60)).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
                 self.kf.cancel_order({
                     "order_id": order_id,
