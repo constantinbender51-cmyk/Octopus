@@ -524,7 +524,8 @@ class Octopus:
             now = datetime.now(timezone.utc)
             
             # Precise Trigger: XX:00:05, XX:15:05, XX:30:05, XX:45:05
-            if now.minute % 15 == 0 and now.second >= 5:
+            # Fix: Added upper bound (< 10) to prevent double execution at :55
+            if now.minute % 15 == 0 and 5 <= now.second < 10:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 
                 # 1. Calculate active timeframes for this trigger
