@@ -9,6 +9,12 @@ Updated to match 'Strategy Union' & 'Majority Vote' logic from Generator v58.
 - Dynamic Execution Window (Sprinter vs Marathoner).
 - NO Retraining during live run.
 - LOGGING: Enhanced decision logging.
+- PERFORMANCE TRACKING: Logs accuracy to GitHub (performance.json).
+- STRICT ACCURACY: 
+    - Moves < min bucket size = Flat (Ignored).
+    - Moves >= min bucket size in OPPOSITE direction = Incorrect.
+    - Moves >= min bucket size in CORRECT direction = Correct.
+- RESET LOGIC: Resets virtual position on every execution.
 """
 
 import os
@@ -74,6 +80,116 @@ logging.basicConfig(
     handlers=[logging.FileHandler("octopus.log"), logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("Octopus")
+
+# --- Performance Tracking Class ---
+
+class PerformanceTracker:
+    def __init__(self):
+        self.stats = defaultdict(lambda: {"correct": 0, "total": 0, "accuracy": 0.0})
+        self.last_predictions = {} # {strat_id: {"signal": int, "price": float, "ts": int, "threshold": float}}
+        self.lock = threading.Lock()
+
+    def evaluate(self, strat_id: str, current_price: float):
+        """
+        Compares the LAST prediction (if exists) against the CURRENT price.
+        Logic:
+        1. Calculate diff = current - last_price.
+        2. If abs(diff) < threshold: Outcome is FLAT.
+           - We ignore FLAT outcomes for scoring (return).
+        3. If abs(diff) >= threshold: Outcome is Directional.
+           - If direction matches signal: CORRECT.
+           - If direction opposes signal: INCORRECT.
+        """
+        with self.lock:
+            if strat_id not in self.last_predictions:
+                return
+
+            last = self.last_predictions[strat_id]
+            last_signal = last["signal"]
+            last_price = last["price"]
+            threshold = last.get("threshold", 0.0)
+            
+            # Remove processed prediction
+            del self.last_predictions[strat_id]
+
+            if last_signal == 0:
+                return # We don't score "Flat" predictions, we only score Directional ones.
+
+            price_diff = current_price - last_price
+
+            # 1. Check if outcome is FLAT (Small movement)
+            # "Small movements in that direction are flat."
+            # "If we predict [direction] and it went flat we ignore."
+            if abs(price_diff) < threshold:
+                return 
+
+            # 2. Outcome is Directional (Big movement)
+            is_correct = False
+            
+            if last_signal == 1: # Predicted UP
+                if price_diff > 0:
+                    is_correct = True
+                else: 
+                    # Moved DOWN by >= threshold
+                    is_correct = False
+            
+            elif last_signal == -1: # Predicted DOWN
+                if price_diff < 0:
+                    is_correct = True
+                else:
+                    # Moved UP by >= threshold
+                    is_correct = False
+
+            # Update Stats
+            self.stats[strat_id]["total"] += 1
+            if is_correct:
+                self.stats[strat_id]["correct"] += 1
+            
+            # Update Percentage
+            total = self.stats[strat_id]["total"]
+            corr = self.stats[strat_id]["correct"]
+            self.stats[strat_id]["accuracy"] = round((corr / total) * 100, 2)
+
+    def record_prediction(self, strat_id: str, signal: int, current_price: float, threshold: float):
+        """Stores the CURRENT prediction and its validation threshold."""
+        with self.lock:
+            self.last_predictions[strat_id] = {
+                "signal": signal,
+                "price": current_price,
+                "ts": int(time.time()),
+                "threshold": threshold
+            }
+
+    def upload_to_github(self):
+        """Uploads the stats dictionary to GitHub as performance.json"""
+        if not GITHUB_PAT: return
+
+        try:
+            # Prepare JSON content
+            content_str = json.dumps(self.stats, indent=2)
+            content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+            
+            url = f"{GITHUB_API_URL}performance.json"
+            headers = {"Authorization": f"Bearer {GITHUB_PAT}"}
+            
+            # Check if file exists to get SHA
+            sha = None
+            try:
+                get_resp = requests.get(url, headers=headers)
+                if get_resp.status_code == 200:
+                    sha = get_resp.json().get("sha")
+            except: pass
+
+            data = {
+                "message": f"Update performance stats {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                "content": content_b64
+            }
+            if sha: data["sha"] = sha
+            
+            requests.put(url, headers=headers, json=data)
+            logger.info("Performance stats uploaded to GitHub.")
+        except Exception as e:
+            logger.error(f"Failed to upload performance stats: {e}")
 
 # --- Strategy Logic Classes ---
 
@@ -206,6 +322,12 @@ class EnsembleStrategy:
         # Initialize Sub-Strategies
         self.sub_strategies = [SubStrategy(cfg) for cfg in config_list]
         
+        # Calculate Minimum Bucket Size for Performance Tracking
+        if self.sub_strategies:
+            self.min_bucket_size = min(s.bucket_size for s in self.sub_strategies)
+        else:
+            self.min_bucket_size = 0.0
+        
     def train(self, prices: List[float]):
         """Trains all sub-strategies."""
         for strat in self.sub_strategies:
@@ -247,7 +369,6 @@ class EnsembleStrategy:
             signal = 0
 
         # --- LOG DECISION ---
-        # Only log if there's a significant divergence or for general tracking
         logger.info(f"[{self.id}] Decision: +{up_votes} / -{down_votes} / ={flat_votes} => Signal: {signal}")
         
         return signal
@@ -263,6 +384,7 @@ class Octopus:
         self.executor = ThreadPoolExecutor(max_workers=None)
         self.total_strategies_count = 0
         self.instrument_specs = {}
+        self.tracker = PerformanceTracker()
 
     def initialize(self):
         logger.info("Initializing Octopus (Parallel Ensemble Version)...")
@@ -314,7 +436,7 @@ class Octopus:
             
             count = 0
             for f in files:
-                if f['name'].endswith(".json"):
+                if f['name'].endswith(".json") and f['name'] != "performance.json":
                     content_resp = requests.get(f['download_url'])
                     data = content_resp.json()
                     
@@ -419,6 +541,9 @@ class Octopus:
                 # 3. Parallel Strategy Execution
                 self._process_strategies_parallel(tfs_to_run)
                 
+                # 4. Upload Performance Stats (Background)
+                self.executor.submit(self.tracker.upload_to_github)
+                
                 # Sleep to prevent re-triggering within the same minute
                 time.sleep(50)
                 
@@ -494,15 +619,15 @@ class Octopus:
             # Marathoner: 5 mins, 10s interval, passive start, slow converge
             exec_duration = 300
             exec_interval = 10
-            start_offset_bp = -5 # -0.05% (against direction = passive)
-            step_bp = 0.5        # 0.005% per 10s
+            start_offset_bp = -5 
+            step_bp = 0.5 
             mode_name = "MARATHONER"
         else:
             # Sprinter: 60s, 5s interval, at mark, fast converge
             exec_duration = 60
             exec_interval = 5
-            start_offset_bp = 0  # At Mark
-            step_bp = 1.0        # 0.01% per 5s
+            start_offset_bp = 0 
+            step_bp = 1.0 
             mode_name = "SPRINTER"
 
         logger.info(f"Execution Mode: {mode_name}")
@@ -515,11 +640,22 @@ class Octopus:
                 active_assets.add(strat.asset)
                 raw = self.price_history[strat.asset]
                 prices = self._resample(raw, strat.timeframe)
-                # NOTE: NO RETRAINING HERE. Using initialized maps.
+                current_price = prices[-1] if prices else 0.0
+
+                # --- 1. PERFORMANCE CHECK (Compare PREVIOUS prediction to CURRENT price) ---
+                self.tracker.evaluate(strat.id, current_price)
+                
+                # --- 2. RESET VIRTUAL POSITION (Strictly 1-candle trade) ---
+                strat.virtual_position = 0.0
+                
+                # --- 3. PREDICT NEW SIGNAL ---
                 sig = strat.predict(prices)
+                
+                # --- 4. RECORD PREDICTION for NEXT check ---
+                self.tracker.record_prediction(strat.id, sig, current_price, strat.min_bucket_size)
+
                 strat.virtual_position = sig * unit_size_usd
                 
-                # Log outcome for this strategy
                 logger.info(f"Strat {strat.id}: Signal {sig} | Alloc: ${strat.virtual_position:.2f}")
 
         # Run signal calcs
@@ -620,25 +756,7 @@ class Octopus:
                 if curr_mark == 0: curr_mark = initial_mark
                 
                 # Calculate Price
-                # BPs to decimal: 1 bp = 0.0001
-                # initial offset (can be negative for passive start)
                 current_aggression_bp = start_offset_bp + (i * step_bp)
-                
-                # If buy: Price = Mark * (1 - offset) if passive, (1 + offset) if aggressive
-                # But here logic is: Buy wants lower price (passive) or higher (aggressive).
-                # start_offset_bp = -5 (Passive). Price = Mark * (1 + (-5 + 0)*0.0001) = Mark * 0.9995
-                # Later: start_offset = -5 + (10*0.5) = 0. Price = Mark.
-                # Later: start = -5 + (20*0.5) = +5. Price = Mark * 1.0005.
-                
-                # Formula: Price = Mark * (1 + (direction * total_bp * 0.0001))
-                # If Buy (dir=1): +bp increases price (aggressive), -bp decreases price (passive).
-                # If Sell (dir=-1): +bp decreases price (aggressive), -bp increases price (passive).
-                
-                # Wait, for Sell, aggressive is LOWER price. Passive is HIGHER.
-                # So if Sell (dir=-1): 
-                #   Price = Mark * (1 - (total_bp * 0.0001))
-                #   If total_bp is -5 (passive), Price = Mark * (1 - (-0.0005)) = Mark * 1.0005 (Higher, good).
-                #   If total_bp is +5 (aggressive), Price = Mark * (1 - 0.0005) = Mark * 0.9995 (Lower, good).
                 
                 pct_change = current_aggression_bp * 0.0001
                 
@@ -661,7 +779,6 @@ class Octopus:
                          logger.info(f"[{symbol}] Order Placed @ {final_limit} ({current_aggression_bp}bp)")
                     else:
                         logger.warning(f"[{symbol}] Order Failed: {resp}")
-                        # If failed, maybe try again next loop?
                 else:
                     # Edit Existing
                     self.kf.edit_order({
@@ -679,8 +796,6 @@ class Octopus:
         # End of Loop Cleanup
         if order_id:
             try:
-                # Cancel any remainder after time is up
-                # logger.info(f"[{symbol}] Time up. Cancelling.")
                 self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
             except: pass
 
