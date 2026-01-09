@@ -9,11 +9,11 @@ Updated to match 'Strategy Union' & 'Majority Vote' logic from Generator v58.
 - Dynamic Execution Window (Sprinter vs Marathoner).
 - NO Retraining during live run.
 - LOGGING: Enhanced decision logging.
-- PERFORMANCE TRACKING: Logs accuracy to GitHub (performance.json).
+- TRADE LOGGING: Local file (trade_log.txt) with strict format.
 - STRICT ACCURACY: 
-    - Moves < min bucket size = Flat (Ignored).
-    - Moves >= min bucket size in OPPOSITE direction = Incorrect.
-    - Moves >= min bucket size in CORRECT direction = Correct.
+    - Moves < min bucket size = Flat (0).
+    - Moves >= min bucket size in OPPOSITE direction = Incorrect (-1).
+    - Moves >= min bucket size in CORRECT direction = Correct (1).
 - RESET LOGIC: Resets virtual position on every execution.
 """
 
@@ -59,6 +59,7 @@ LEVERAGE = 2.0
 REPO_OWNER = "constantinbender51-cmyk"
 REPO_NAME = "Models"
 GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
+TRADE_LOG_FILE = "trade_log.txt"
 
 # Asset Mapping (Binance USDT -> Kraken Futures Perpetual)
 SYMBOL_MAP = {
@@ -81,115 +82,72 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Octopus")
 
-# --- Performance Tracking Class ---
+# --- Trade Logger Class ---
 
-class PerformanceTracker:
-    def __init__(self):
-        self.stats = defaultdict(lambda: {"correct": 0, "total": 0, "accuracy": 0.0})
-        self.last_predictions = {} # {strat_id: {"signal": int, "price": float, "ts": int, "threshold": float}}
+class TradeLogger:
+    def __init__(self, filename=TRADE_LOG_FILE):
+        self.filename = filename
+        # Stores active trade state: {strat_id: {"signal": int, "price": float, "threshold": float}}
+        self.pending_trades = {}
         self.lock = threading.Lock()
 
-    def evaluate(self, strat_id: str, current_price: float):
+    def evaluate_and_log_close(self, strat_id: str, current_price: float, time_str: str):
         """
-        Compares the LAST prediction (if exists) against the CURRENT price.
-        Logic:
-        1. Calculate diff = current - last_price.
-        2. If abs(diff) < threshold: Outcome is FLAT.
-           - We ignore FLAT outcomes for scoring (return).
-        3. If abs(diff) >= threshold: Outcome is Directional.
-           - If direction matches signal: CORRECT.
-           - If direction opposes signal: INCORRECT.
+        Checks the outcome of the previous prediction and writes the Close log.
+        Outcome: 1 (Correct), -1 (Incorrect), 0 (Flat/Small Move).
         """
         with self.lock:
-            if strat_id not in self.last_predictions:
+            if strat_id not in self.pending_trades:
                 return
 
-            last = self.last_predictions[strat_id]
+            last = self.pending_trades[strat_id]
             last_signal = last["signal"]
             last_price = last["price"]
             threshold = last.get("threshold", 0.0)
             
-            # Remove processed prediction
-            del self.last_predictions[strat_id]
+            # Remove processed prediction immediately
+            del self.pending_trades[strat_id]
 
-            if last_signal == 0:
-                return # We don't score "Flat" predictions, we only score Directional ones.
-
+            # Logic matching strict accuracy rules
             price_diff = current_price - last_price
+            outcome = 0 # Default Flat
 
-            # 1. Check if outcome is FLAT (Small movement)
-            # "Small movements in that direction are flat."
-            # "If we predict [direction] and it went flat we ignore."
             if abs(price_diff) < threshold:
-                return 
-
-            # 2. Outcome is Directional (Big movement)
-            is_correct = False
+                outcome = 0 # Flat
+            else:
+                if last_signal == 1: # Predicted UP
+                    outcome = 1 if price_diff > 0 else -1
+                elif last_signal == -1: # Predicted DOWN
+                    outcome = 1 if price_diff < 0 else -1
             
-            if last_signal == 1: # Predicted UP
-                if price_diff > 0:
-                    is_correct = True
-                else: 
-                    # Moved DOWN by >= threshold
-                    is_correct = False
-            
-            elif last_signal == -1: # Predicted DOWN
-                if price_diff < 0:
-                    is_correct = True
-                else:
-                    # Moved UP by >= threshold
-                    is_correct = False
+            # Write Close Log
+            # Format: Close [strategy_name] 1/0/-1 [time]
+            try:
+                with open(self.filename, "a") as f:
+                    f.write(f"Close [{strat_id}] {outcome} [{time_str}]\n")
+            except Exception as e:
+                logger.error(f"Failed to write close log: {e}")
 
-            # Update Stats
-            self.stats[strat_id]["total"] += 1
-            if is_correct:
-                self.stats[strat_id]["correct"] += 1
-            
-            # Update Percentage
-            total = self.stats[strat_id]["total"]
-            corr = self.stats[strat_id]["correct"]
-            self.stats[strat_id]["accuracy"] = round((corr / total) * 100, 2)
-
-    def record_prediction(self, strat_id: str, signal: int, current_price: float, threshold: float):
-        """Stores the CURRENT prediction and its validation threshold."""
+    def log_signal_and_store(self, strat_id: str, signal: int, current_price: float, threshold: float, time_str: str):
+        """
+        Writes the Signal log (if non-zero) and stores state for next evaluation.
+        """
         with self.lock:
-            self.last_predictions[strat_id] = {
+            # Only log signals if they are actionable (non-zero)
+            if signal != 0:
+                # Format: Signal: 1/-1 [strategy_name] [time]
+                try:
+                    with open(self.filename, "a") as f:
+                        f.write(f"Signal: {signal} [{strat_id}] [{time_str}]\n")
+                except Exception as e:
+                    logger.error(f"Failed to write signal log: {e}")
+            
+            # Store state for next cycle's evaluation
+            self.pending_trades[strat_id] = {
                 "signal": signal,
                 "price": current_price,
-                "ts": int(time.time()),
                 "threshold": threshold
             }
-
-    def upload_to_github(self):
-        """Uploads the stats dictionary to GitHub as performance.json"""
-        if not GITHUB_PAT: return
-
-        try:
-            # Prepare JSON content
-            content_str = json.dumps(self.stats, indent=2)
-            content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
-            
-            url = f"{GITHUB_API_URL}performance.json"
-            headers = {"Authorization": f"Bearer {GITHUB_PAT}"}
-            
-            # Check if file exists to get SHA
-            sha = None
-            try:
-                get_resp = requests.get(url, headers=headers)
-                if get_resp.status_code == 200:
-                    sha = get_resp.json().get("sha")
-            except: pass
-
-            data = {
-                "message": f"Update performance stats {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                "content": content_b64
-            }
-            if sha: data["sha"] = sha
-            
-            requests.put(url, headers=headers, json=data)
-            logger.info("Performance stats uploaded to GitHub.")
-        except Exception as e:
-            logger.error(f"Failed to upload performance stats: {e}")
 
 # --- Strategy Logic Classes ---
 
@@ -384,7 +342,8 @@ class Octopus:
         self.executor = ThreadPoolExecutor(max_workers=None)
         self.total_strategies_count = 0
         self.instrument_specs = {}
-        self.tracker = PerformanceTracker()
+        # New Trade Logger
+        self.trade_logger = TradeLogger()
 
     def initialize(self):
         logger.info("Initializing Octopus (Parallel Ensemble Version)...")
@@ -524,7 +483,6 @@ class Octopus:
             now = datetime.now(timezone.utc)
             
             # Precise Trigger: XX:00:05, XX:15:05, XX:30:05, XX:45:05
-            # Fix: Added upper bound (< 10) to prevent double execution at :55
             if now.minute % 15 == 0 and 5 <= now.second < 10:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 
@@ -541,9 +499,6 @@ class Octopus:
                 
                 # 3. Parallel Strategy Execution
                 self._process_strategies_parallel(tfs_to_run)
-                
-                # 4. Upload Performance Stats (Background)
-                self.executor.submit(self.tracker.upload_to_github)
                 
                 # Sleep to prevent re-triggering within the same minute
                 time.sleep(50)
@@ -642,9 +597,10 @@ class Octopus:
                 raw = self.price_history[strat.asset]
                 prices = self._resample(raw, strat.timeframe)
                 current_price = prices[-1] if prices else 0.0
+                time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # --- 1. PERFORMANCE CHECK (Compare PREVIOUS prediction to CURRENT price) ---
-                self.tracker.evaluate(strat.id, current_price)
+                # --- 1. EVALUATE PREVIOUS TRADE & LOG CLOSE ---
+                self.trade_logger.evaluate_and_log_close(strat.id, current_price, time_str)
                 
                 # --- 2. RESET VIRTUAL POSITION (Strictly 1-candle trade) ---
                 strat.virtual_position = 0.0
@@ -652,8 +608,8 @@ class Octopus:
                 # --- 3. PREDICT NEW SIGNAL ---
                 sig = strat.predict(prices)
                 
-                # --- 4. RECORD PREDICTION for NEXT check ---
-                self.tracker.record_prediction(strat.id, sig, current_price, strat.min_bucket_size)
+                # --- 4. LOG SIGNAL & STORE STATE ---
+                self.trade_logger.log_signal_and_store(strat.id, sig, current_price, strat.min_bucket_size, time_str)
 
                 strat.virtual_position = sig * unit_size_usd
                 
