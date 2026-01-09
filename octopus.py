@@ -2,12 +2,10 @@
 """
 Octopus: Multi-Strategy Aggregator & Execution Engine for Kraken Futures.
 Updated for 'Strategy Union' (Pre-trained JSONs).
+- FIX: Deserializes JSON string keys back to Integers (Fixes TypeError).
 - NO Retraining (loads maps directly from JSON).
 - Fast Startup (fetches only recent context).
-- PARALLEL EXECUTION (ThreadPoolExecutor).
-- Precise Timing (Execute at XX:XX:05).
-- Dynamic Execution Window (Sprinter vs Marathoner).
-- STRICT ACCURACY TRACKING.
+- PARALLEL EXECUTION.
 - ROBUST LOADING (Skips bad JSONs).
 """
 
@@ -163,7 +161,6 @@ class SubStrategy:
     Now loads Pre-Trained Maps directly from JSON.
     """
     def __init__(self, strategy_data: dict):
-        # Validation is done before Init, but safe access here
         config = strategy_data.get('config', {})
         params = strategy_data.get('trained_parameters', {})
         
@@ -180,19 +177,31 @@ class SubStrategy:
         self.der_map = self._deserialize_map(params.get('der_map', {}))
 
     def _deserialize_map(self, serialized_map: dict) -> dict:
-        """Converts JSON keys '1|2|3' back to tuples (1, 2, 3) and dicts to Counters."""
+        """
+        Converts JSON keys '1|2|3' back to tuples (1, 2, 3).
+        CRITICAL: Converts inner dictionary keys (predictions) from String to Int.
+        """
         deserialized = {}
         for k, v in serialized_map.items():
             if k == "":
                 tuple_key = ()
             else:
-                # Convert pipe-separated string back to tuple of integers
                 try:
                     tuple_key = tuple(int(x) for x in k.split("|"))
                 except ValueError:
-                    continue # Skip malformed keys
+                    continue 
             
-            deserialized[tuple_key] = Counter(v)
+            # CRITICAL FIX: Convert inner dict keys from 'str' to 'int'
+            # JSON stores { "5": 10 }, we need { 5: 10 }
+            inner_counter = Counter()
+            for inner_k, inner_v in v.items():
+                try:
+                    inner_counter[int(inner_k)] = inner_v
+                except ValueError:
+                    continue
+                    
+            deserialized[tuple_key] = inner_counter
+            
         return deserialized
 
     def _get_bucket(self, price: float) -> int:
@@ -227,11 +236,13 @@ class SubStrategy:
         # Prediction Logic
         if self.model_type == "Absolute":
             if a_seq in self.abs_map:
+                # Returns INT now, thanks to fix in _deserialize_map
                 return self.abs_map[a_seq].most_common(1)[0][0]
             return random.choice(self.all_vals) if self.all_vals else last_val
             
         elif self.model_type == "Derivative":
             if d_seq in self.der_map:
+                # Returns INT
                 change = self.der_map[d_seq].most_common(1)[0][0]
                 return last_val + change
             change = random.choice(self.all_changes) if self.all_changes else 0
@@ -265,14 +276,11 @@ class EnsembleStrategy:
         self.id = f"{asset}_{timeframe}"
         self.virtual_position = 0.0
         
-        # Initialize Sub-Strategies with pre-trained data
-        # Only add valid sub-strategies
         self.sub_strategies = []
         for s_data in strategy_union:
              if 'config' in s_data and 'trained_parameters' in s_data:
                  self.sub_strategies.append(SubStrategy(s_data))
         
-        # Calculate Minimum Bucket Size for Performance Tracking
         if self.sub_strategies:
             self.min_bucket_size = min(s.bucket_size for s in self.sub_strategies)
         else:
@@ -295,13 +303,17 @@ class EnsembleStrategy:
             # 2. Compare to Current Bucket
             current_bucket = strat._get_bucket(recent_prices[-1])
             
+            # Check for type mismatch if fix failed
+            if isinstance(pred_bucket, str):
+                logger.error(f"FATAL: pred_bucket is string '{pred_bucket}' in {self.id}")
+                continue
+
             diff = pred_bucket - current_bucket
             
             if diff > 0: votes.append(1)
             elif diff < 0: votes.append(-1)
             else: votes.append(0)
             
-        # Majority Vote Logic
         up_votes = votes.count(1)
         down_votes = votes.count(-1)
         flat_votes = votes.count(0)
@@ -343,10 +355,7 @@ class Octopus:
             logger.error(f"Stress test failed/skipped: {e}")
 
         self._load_strategies_from_github()
-        
-        # Only fetch recent context (last 500 candles) to seed the sequence
         self._fetch_recent_context()
-        
         logger.info("Initialization Complete. Bot ready.")
 
     def _fetch_instrument_specs(self):
@@ -389,33 +398,24 @@ class Octopus:
                         asset = data.get('asset')
                         tf = data.get('timeframe')
                         
-                        # Validate Keys
-                        if not asset or not tf:
-                            logger.warning(f"Skipping malformed file: {f['name']}")
-                            continue
+                        if not asset or not tf: continue
 
-                        # Filtering: Combined Accuracy > 60%
                         acc = data.get('combined_accuracy', 0)
                         if acc < 60.0:
                             logger.warning(f"Skipping {asset} {tf} (Acc {acc:.2f}%)")
                             continue
                         
-                        # Load the FULL strategy union
                         strategy_union = data.get('strategy_union', [])
-                        if not strategy_union: 
-                            continue
+                        if not strategy_union: continue
 
-                        # Create Strategy
                         ens = EnsembleStrategy(asset, tf, strategy_union)
-                        if not ens.sub_strategies:
-                            logger.warning(f"Skipping {asset} {tf}: No valid sub-strategies found.")
-                            continue
+                        if not ens.sub_strategies: continue
                             
                         self.strategies[ens.id] = ens
                         count += 1
                         
                 except Exception as inner_e:
-                    logger.error(f"Failed to load specific file {f.get('name', 'unknown')}: {inner_e}")
+                    logger.error(f"Failed to load file {f.get('name')}: {inner_e}")
                     continue
             
             self.total_strategies_count = count
@@ -425,14 +425,12 @@ class Octopus:
             logger.error(f"Failed to fetch file list from GitHub: {e}")
 
     def _fetch_recent_context(self):
-        """Fetches only the last 500 candles per asset to seed the sequence."""
         active_assets = set(s.asset for s in self.strategies.values())
         logger.info(f"Fetching recent context for {len(active_assets)} assets...")
         
         for asset in active_assets:
             try:
                 url = "https://api.binance.com/api/v3/klines"
-                # Limit 500 is enough for any reasonable seq_len
                 params = {"symbol": asset, "interval": "15m", "limit": 500}
                 r = requests.get(url, params=params)
                 data = r.json()
@@ -442,8 +440,7 @@ class Octopus:
                     logger.info(f"[{asset}] Context Loaded: {len(data)} candles.")
                 else:
                     logger.warning(f"[{asset}] No data returned.")
-                    
-                time.sleep(0.1) # Slight throttle
+                time.sleep(0.1)
             except Exception as e:
                 logger.error(f"Context fetch error {asset}: {e}")
 
@@ -472,11 +469,9 @@ class Octopus:
         while True:
             now = datetime.now(timezone.utc)
             
-            # Precise Trigger: XX:00:05, XX:15:05, XX:30:05, XX:45:05
             if now.minute % 15 == 0 and 5 <= now.second < 10:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 
-                # 1. Calculate active timeframes for this trigger
                 tfs_to_run = ["15m"]
                 if now.minute == 0 or now.minute == 30: tfs_to_run.append("30m")
                 if now.minute == 0:
@@ -484,13 +479,8 @@ class Octopus:
                     if now.hour % 4 == 0: tfs_to_run.append("240m")
                     if now.hour == 0: tfs_to_run.append("1d")
                 
-                # 2. Parallel Data Update
                 self._update_all_data_parallel()
-                
-                # 3. Parallel Strategy Execution
                 self._process_strategies_parallel(tfs_to_run)
-                
-                # 4. Upload Performance Stats (Background)
                 self.executor.submit(self.tracker.upload_to_github)
                 
                 time.sleep(50)
@@ -510,11 +500,9 @@ class Octopus:
                 open_ts = int(candle[0])
                 close_ts = int(candle[6])
                 price = float(candle[4])
-                # Ensure we don't add future candles beyond the current trigger time
                 if close_ts > last_stored_ts and open_ts < limit_ts:
                     self.price_history[asset].append((close_ts, price))
                     
-            # Keep history manageable
             if len(self.price_history[asset]) > 2000:
                 self.price_history[asset] = self.price_history[asset][-2000:]
         except Exception as e:
@@ -536,7 +524,6 @@ class Octopus:
     def _process_strategies_parallel(self, active_tfs: List[str]):
         try:
             acc = self.kf.get_accounts()
-            # Handle flex/multi-collateral structure
             if "flex" in acc.get("accounts", {}):
                 equity = float(acc["accounts"]["flex"].get("marginEquity", 0))
             elif "accounts" in acc:
@@ -582,24 +569,16 @@ class Octopus:
                 prices = self._resample(raw, strat.timeframe)
                 current_price = prices[-1] if prices else 0.0
 
-                # --- 1. PERFORMANCE CHECK ---
                 self.tracker.evaluate(strat.id, current_price)
-                
-                # --- 2. PREDICT ---
                 sig = strat.predict(prices)
-                
-                # --- 3. RECORD PREDICTION ---
                 self.tracker.record_prediction(strat.id, sig, current_price, strat.min_bucket_size)
 
                 strat.virtual_position = sig * unit_size_usd
-                
                 logger.info(f"Strat {strat.id}: Signal {sig} | Alloc: ${strat.virtual_position:.2f}")
 
-        # Run signal calcs
         f_sigs = [self.executor.submit(calc_signal, s) for s in self.strategies.values()]
         for f in f_sigs: f.result()
 
-        # 3. Execute Asset Logic Parallel
         for asset in active_assets:
             self.executor.submit(
                 self._execute_single_asset_logic, 
