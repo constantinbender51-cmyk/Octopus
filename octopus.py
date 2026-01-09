@@ -799,4 +799,14 @@ class Octopus:
                 time.sleep(interval)
             except Exception as e:
                 logger.error(f"[{symbol}] Maker Loop Error: {e}")
-                time.sleep
+                time.sleep(1)
+        
+        if order_id:
+            try:
+                self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
+            except: pass
+
+if __name__ == "__main__":
+    bot = Octopus()
+    bot.initialize()
+    bot.run()
