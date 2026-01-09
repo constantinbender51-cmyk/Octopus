@@ -8,6 +8,7 @@ Updated for 'Strategy Union' (Pre-trained JSONs).
 - Precise Timing (Execute at XX:XX:05).
 - Dynamic Execution Window (Sprinter vs Marathoner).
 - STRICT ACCURACY TRACKING.
+- ROBUST LOADING (Skips bad JSONs).
 """
 
 import os
@@ -162,20 +163,21 @@ class SubStrategy:
     Now loads Pre-Trained Maps directly from JSON.
     """
     def __init__(self, strategy_data: dict):
-        config = strategy_data['config']
-        params = strategy_data['trained_parameters']
+        # Validation is done before Init, but safe access here
+        config = strategy_data.get('config', {})
+        params = strategy_data.get('trained_parameters', {})
         
-        self.model_type = config['model_type']
+        self.model_type = config.get('model_type', 'Absolute')
         
         # Load Parameters directly
-        self.bucket_size = params['bucket_size']
-        self.seq_len = params['seq_len']
-        self.all_vals = params['all_vals']
-        self.all_changes = params['all_changes']
+        self.bucket_size = params.get('bucket_size', 1.0)
+        self.seq_len = params.get('seq_len', 3)
+        self.all_vals = params.get('all_vals', [])
+        self.all_changes = params.get('all_changes', [])
         
         # Deserialize Maps (String Key -> Tuple Key)
-        self.abs_map = self._deserialize_map(params['abs_map'])
-        self.der_map = self._deserialize_map(params['der_map'])
+        self.abs_map = self._deserialize_map(params.get('abs_map', {}))
+        self.der_map = self._deserialize_map(params.get('der_map', {}))
 
     def _deserialize_map(self, serialized_map: dict) -> dict:
         """Converts JSON keys '1|2|3' back to tuples (1, 2, 3) and dicts to Counters."""
@@ -264,7 +266,11 @@ class EnsembleStrategy:
         self.virtual_position = 0.0
         
         # Initialize Sub-Strategies with pre-trained data
-        self.sub_strategies = [SubStrategy(s_data) for s_data in strategy_union]
+        # Only add valid sub-strategies
+        self.sub_strategies = []
+        for s_data in strategy_union:
+             if 'config' in s_data and 'trained_parameters' in s_data:
+                 self.sub_strategies.append(SubStrategy(s_data))
         
         # Calculate Minimum Bucket Size for Performance Tracking
         if self.sub_strategies:
@@ -278,6 +284,7 @@ class EnsembleStrategy:
         Logic: Majority Vote.
         """
         if not recent_prices: return 0
+        if not self.sub_strategies: return 0
         
         votes = []
         
@@ -374,32 +381,48 @@ class Octopus:
             
             count = 0
             for f in files:
-                if f['name'].endswith(".json") and f['name'] != "performance.json":
-                    content_resp = requests.get(f['download_url'])
-                    data = content_resp.json()
-                    
-                    asset = data.get('asset')
-                    tf = data.get('timeframe')
-                    
-                    # Filtering: Combined Accuracy > 60%
-                    acc = data.get('combined_accuracy', 0)
-                    if acc < 60.0:
-                        logger.warning(f"Skipping {asset} {tf} (Acc {acc:.2f}%)")
-                        continue
-                    
-                    # Load the FULL strategy union
-                    strategy_union = data.get('strategy_union', [])
-                    if not strategy_union: continue
+                try:
+                    if f['name'].endswith(".json") and f['name'] != "performance.json":
+                        content_resp = requests.get(f['download_url'])
+                        data = content_resp.json()
+                        
+                        asset = data.get('asset')
+                        tf = data.get('timeframe')
+                        
+                        # Validate Keys
+                        if not asset or not tf:
+                            logger.warning(f"Skipping malformed file: {f['name']}")
+                            continue
 
-                    ens = EnsembleStrategy(asset, tf, strategy_union)
-                    self.strategies[ens.id] = ens
-                    count += 1
+                        # Filtering: Combined Accuracy > 60%
+                        acc = data.get('combined_accuracy', 0)
+                        if acc < 60.0:
+                            logger.warning(f"Skipping {asset} {tf} (Acc {acc:.2f}%)")
+                            continue
+                        
+                        # Load the FULL strategy union
+                        strategy_union = data.get('strategy_union', [])
+                        if not strategy_union: 
+                            continue
+
+                        # Create Strategy
+                        ens = EnsembleStrategy(asset, tf, strategy_union)
+                        if not ens.sub_strategies:
+                            logger.warning(f"Skipping {asset} {tf}: No valid sub-strategies found.")
+                            continue
+                            
+                        self.strategies[ens.id] = ens
+                        count += 1
+                        
+                except Exception as inner_e:
+                    logger.error(f"Failed to load specific file {f.get('name', 'unknown')}: {inner_e}")
+                    continue
             
             self.total_strategies_count = count
             logger.info(f"Loaded {count} Ensemble Strategies.")
             
         except Exception as e:
-            logger.error(f"Failed to load strategies: {e}")
+            logger.error(f"Failed to fetch file list from GitHub: {e}")
 
     def _fetch_recent_context(self):
         """Fetches only the last 500 candles per asset to seed the sequence."""
