@@ -2,17 +2,7 @@
 """
 Octopus: Multi-Strategy Aggregator & Execution Engine for Kraken Futures.
 Updated to match 'Strategy Union' & 'Majority Vote' logic from Generator v58.
-- Uses Fixed Bucket Size from JSON.
-- FIXED TRAINING HORIZON: "Now" for training defined as 2026-01-01.
-- Trains on 70% of (2020 -> 2026-01-01).
-- Verifies on 30% of (2020 -> 2026-01-01).
-- PARALLEL EXECUTION (ThreadPoolExecutor).
-- Precise Timing (Execute at XX:XX:05).
-- Dynamic Execution Window (Sprinter vs Marathoner).
-- NO Retraining during live run.
-- LOGGING: Enhanced decision logging.
-- PERFORMANCE TRACKING: Logs accuracy to GitHub (performance.json).
-- STARTUP VALIDATION: Backtests the 30% holdout set to verify accuracy matches JSON specs.
+Includes STARTUP DIAGNOSTIC BACKTEST (2020-2026) followed by FRESH DATA LOAD for Live.
 """
 
 import os
@@ -58,11 +48,6 @@ REPO_OWNER = "constantinbender51-cmyk"
 REPO_NAME = "Models"
 GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
 
-# --- DEFINING 'NOW' FOR MODEL CONSISTENCY ---
-# This ensures that regardless of the actual date, the model trains/verifies
-# on the exact same dataset (2020-01-01 to 2026-01-01).
-TRAINING_END_DATE = "2026-01-01"
-
 # Asset Mapping (Binance USDT -> Kraken Futures Perpetual)
 SYMBOL_MAP = {
     "BTCUSDT": "ff_xbtusd_260327",
@@ -89,13 +74,10 @@ logger = logging.getLogger("Octopus")
 class PerformanceTracker:
     def __init__(self):
         self.stats = defaultdict(lambda: {"correct": 0, "total": 0, "accuracy": 0.0})
-        self.last_predictions = {} # {strat_id: {"signal": int, "price": float, "ts": int, "threshold": float}}
+        self.last_predictions = {} 
         self.lock = threading.Lock()
 
     def evaluate(self, strat_id: str, current_price: float):
-        """
-        Compares the LAST prediction (if exists) against the CURRENT price.
-        """
         with self.lock:
             if strat_id not in self.last_predictions:
                 return
@@ -116,13 +98,16 @@ class PerformanceTracker:
             if abs(price_diff) < threshold:
                 return 
 
-            # 2. Outcome is Directional (Big movement)
+            # 2. Outcome is Directional
             is_correct = False
             
             if last_signal == 1: 
                 if price_diff > 0: is_correct = True
+                else: is_correct = False
+            
             elif last_signal == -1: 
                 if price_diff < 0: is_correct = True
+                else: is_correct = False
 
             # Update Stats
             self.stats[strat_id]["total"] += 1
@@ -162,92 +147,84 @@ class PerformanceTracker:
             }
             if sha: data["sha"] = sha
             requests.put(url, headers=headers, json=data)
-            logger.info("Performance stats uploaded to GitHub.")
         except Exception as e:
             logger.error(f"Failed to upload performance stats: {e}")
 
 # --- Strategy Logic Classes ---
 
 class SubStrategy:
-    """
-    Represents a single model configuration (one item in 'strategy_union').
-    """
     def __init__(self, config: dict):
         self.config = config
         self.bucket_count = config.get('bucket_count', 100)
         self.seq_len = config['seq_len']
         self.model_type = config['model_type']
         self.bucket_size = config.get('bucket_size', 1.0)
-        if self.bucket_size <= 0: self.bucket_size = 1e-9
+        if self.bucket_size <= 0: self.bucket_size = 1.0
         
-        # Runtime State
         self.abs_map = defaultdict(Counter)
         self.der_map = defaultdict(Counter)
         self.all_vals = []
         self.all_changes = []
-        self.trained_buckets = [] # For backtesting verification
 
     def _get_bucket(self, price: float) -> int:
         bs = self.bucket_size
+        if bs <= 0: bs = 1e-9
         if price >= 0:
             return int(price // bs)
         else:
             return int(price // bs) - 1
 
-    def train(self, prices: List[float]):
+    def populate_maps(self, prices: List[float], train_limit_idx: int = None):
         """
-        Trains the model using ONLY the first 70% of the provided data.
-        NOTE: 'prices' passed here should already be truncated to TRAINING_END_DATE.
+        Populates the probability maps using the provided prices.
+        If train_limit_idx is provided, ONLY uses data up to that index (for split verification).
+        If None, uses ALL provided data (for live execution).
         """
         if not prices: return
 
-        # 1. Bucketize ALL prices
-        self.trained_buckets = [self._get_bucket(p) for p in prices]
+        buckets = [self._get_bucket(p) for p in prices]
         
-        # 2. Apply 70% Split (Match app.py logic)
-        split_idx = int(len(self.trained_buckets) * 0.7)
-        train_buckets = self.trained_buckets[:split_idx]
-        
-        if len(train_buckets) < self.seq_len + 10: return 
+        # Determine the subset of data to learn from
+        if train_limit_idx is not None:
+            learn_buckets = buckets[:train_limit_idx]
+        else:
+            learn_buckets = buckets
+
+        if len(learn_buckets) < self.seq_len + 10:
+            return 
             
-        # 3. Build Maps on TRAIN set only
-        self.all_vals = list(set(train_buckets))
-        self.all_changes = list(set(train_buckets[j] - train_buckets[j-1] for j in range(1, len(train_buckets))))
+        self.all_vals = list(set(learn_buckets))
+        self.all_changes = list(set(learn_buckets[j] - learn_buckets[j-1] for j in range(1, len(learn_buckets))))
         if not self.all_vals: self.all_vals = [0]
         if not self.all_changes: self.all_changes = [0]
         
         self.abs_map.clear()
         self.der_map.clear()
         
-        for i in range(len(train_buckets) - self.seq_len):
-            a_seq = tuple(train_buckets[i : i + self.seq_len])
-            self.abs_map[a_seq][train_buckets[i + self.seq_len]] += 1
+        for i in range(len(learn_buckets) - self.seq_len):
+            a_seq = tuple(learn_buckets[i : i + self.seq_len])
+            self.abs_map[a_seq][learn_buckets[i + self.seq_len]] += 1
             
             if self.seq_len > 1:
                 d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
-                d_succ = train_buckets[i + self.seq_len] - train_buckets[i + self.seq_len - 1]
+                d_succ = learn_buckets[i + self.seq_len] - learn_buckets[i + self.seq_len - 1]
                 self.der_map[d_seq][d_succ] += 1
 
     def get_prediction_value(self, recent_prices: List[float]) -> int:
-        """Live prediction using recent price list."""
         if len(recent_prices) < self.seq_len + 1:
             return self._get_bucket(recent_prices[-1]) if recent_prices else 0
             
         buckets = [self._get_bucket(p) for p in recent_prices]
         window = buckets[-(self.seq_len + 1):] 
         
-        return self._predict_internal(window)
-
-    def _predict_internal(self, window_buckets: List[int]) -> int:
-        """Internal helper for prediction based on bucket window."""
-        a_seq = tuple(window_buckets[1:]) 
-        last_val = window_buckets[-1]
-        
+        a_seq = tuple(window[1:]) 
         if self.seq_len > 1:
             d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
         else:
             d_seq = ()
-
+            
+        last_val = window[-1]
+        
         if self.model_type == "Absolute":
             if a_seq in self.abs_map:
                 return self.abs_map[a_seq].most_common(1)[0][0]
@@ -278,15 +255,16 @@ class SubStrategy:
         return last_val
 
 class EnsembleStrategy:
-    """
-    Holds the 'Strategy Union' for a specific Asset/Timeframe.
-    """
-    def __init__(self, asset: str, timeframe: str, config_list: List[dict], expected_acc: float):
+    def __init__(self, asset: str, timeframe: str, config_list: List[dict], expected_acc: float = 0.0, expected_trades: int = 0):
         self.asset = asset
         self.timeframe = timeframe
         self.id = f"{asset}_{timeframe}"
         self.virtual_position = 0.0
+        
+        # Validation benchmarks
         self.expected_accuracy = expected_acc
+        self.expected_trades = expected_trades
+        
         self.sub_strategies = [SubStrategy(cfg) for cfg in config_list]
         
         if self.sub_strategies:
@@ -294,9 +272,9 @@ class EnsembleStrategy:
         else:
             self.min_bucket_size = 0.0
         
-    def train(self, prices: List[float]):
+    def populate_maps(self, prices: List[float], train_limit_idx: int = None):
         for strat in self.sub_strategies:
-            strat.train(prices)
+            strat.populate_maps(prices, train_limit_idx)
             
     def predict(self, recent_prices: List[float]) -> int:
         if not recent_prices: return 0
@@ -312,95 +290,9 @@ class EnsembleStrategy:
         up_votes = votes.count(1)
         down_votes = votes.count(-1)
         
-        signal = 0
-        if up_votes > down_votes: signal = 1
-        elif down_votes > up_votes: signal = -1
-        
-        logger.info(f"[{self.id}] Decision: +{up_votes} / -{down_votes} => Signal: {signal}")
-        return signal
-
-    def run_backtest_verification(self) -> Tuple[float, float, str]:
-        """
-        Replicates 'run_portfolio_analysis' on the 30% holdout set.
-        Returns: (Calculated Accuracy, Expected Accuracy, Status Message)
-        """
-        if not self.sub_strategies: return 0.0, self.expected_accuracy, "No Sub-Strategies"
-        
-        # 1. Determine common test range
-        # We assume all sub-strategies were fed the same 'prices' list, so lengths match.
-        sample_strat = self.sub_strategies[0]
-        total_len = len(sample_strat.trained_buckets)
-        split_idx = int(total_len * 0.7)
-        max_seq_len = max(s.seq_len for s in self.sub_strategies)
-        
-        start_test_idx = split_idx
-        total_test_len = total_len - start_test_idx - max_seq_len
-        
-        if total_test_len < 10:
-            return 0.0, self.expected_accuracy, "Insufficient Data for Backtest"
-
-        unique_correct = 0
-        unique_total = 0
-        
-        # 2. Scan the test set
-        for i in range(total_test_len):
-            curr_raw_idx = start_test_idx + i
-            active_directions = []
-            
-            # Check each model
-            for strat in self.sub_strategies:
-                seq_len = strat.seq_len
-                buckets = strat.trained_buckets
-                
-                window_input = buckets[curr_raw_idx : curr_raw_idx + seq_len + 1] # +1 for internal logic
-                a_seq = window_input[:-1] # The sequence
-                last_val = a_seq[-1]
-                actual_val = buckets[curr_raw_idx + seq_len] # The truth
-                pred_val = strat._predict_internal(window_input) # Uses window logic
-                
-                # Determine model's view of reality
-                diff = actual_val - last_val
-                model_actual_dir = 1 if diff > 0 else (-1 if diff < 0 else 0)
-                
-                pred_diff = pred_val - last_val
-                
-                if pred_diff != 0:
-                    direction = 1 if pred_diff > 0 else -1
-                    is_correct = (direction == model_actual_dir)
-                    is_flat = (model_actual_dir == 0)
-                    
-                    active_directions.append({
-                        "dir": direction,
-                        "is_correct": is_correct,
-                        "is_flat": is_flat
-                    })
-            
-            # Aggregate
-            if not active_directions: continue
-            
-            dirs = [x['dir'] for x in active_directions]
-            up = dirs.count(1)
-            down = dirs.count(-1)
-            
-            final_dir = 0
-            if up > down: final_dir = 1
-            elif down > up: final_dir = -1
-            else: continue # Tie
-            
-            winning_voters = [x for x in active_directions if x['dir'] == final_dir]
-            
-            # Filter Logic from app.py
-            if all(x['is_flat'] for x in winning_voters):
-                continue
-                
-            unique_total += 1
-            if any(x['is_correct'] for x in winning_voters):
-                unique_correct += 1
-                
-        calculated_acc = (unique_correct / unique_total * 100) if unique_total > 0 else 0.0
-        
-        msg = f"Calc: {calculated_acc:.2f}% vs Spec: {self.expected_accuracy:.2f}% (Trades: {unique_total})"
-        return calculated_acc, self.expected_accuracy, msg
+        if up_votes > down_votes: return 1
+        elif down_votes > up_votes: return -1
+        return 0
 
 # --- Main Octopus Engine ---
 
@@ -415,9 +307,10 @@ class Octopus:
         self.tracker = PerformanceTracker()
 
     def initialize(self):
-        logger.info(f"Initializing Octopus with FIXED Training Horizon: {TRAINING_END_DATE}")
+        logger.info("Initializing Octopus (Backtest & Live Mode)...")
         self._fetch_instrument_specs()
         
+        # 1. Startup Stress Test
         logger.info("Executing Startup Stress Test...")
         try:
             stress_test.run_stress_test(
@@ -426,36 +319,26 @@ class Octopus:
         except Exception as e:
             logger.error(f"Stress test failed/skipped: {e}")
 
+        # 2. Load Strategy Configs
         self._load_strategies_from_github()
-        self._fetch_initial_data()
-        self._train_all_strategies()
         
-        # --- NEW VALIDATION STEP ---
-        logger.info("Running Startup Backtest Verification...")
-        self.verify_strategies_on_startup()
+        # 3. VERIFICATION PHASE (2020-01-01 to 2026-01-01)
+        logger.info("--- PHASE 1: DIAGNOSTIC BACKTEST (2020-2026) ---")
+        self._fetch_verification_data()
+        self.verify_strategies()
         
-        logger.info("Initialization Complete. Strategies trained and verified.")
-
-    def verify_strategies_on_startup(self):
-        """
-        Runs the backtest logic on all strategies.
-        If any strategy deviates > 5% from its spec, triggers ALARM (Exit).
-        """
-        alarm_triggered = False
+        # 4. LIVE PHASE (Fresh Data)
+        logger.info("--- PHASE 2: PREPARING FOR LIVE EXECUTION ---")
+        logger.info("Clearing historical verification data...")
+        self.price_history.clear() # Dump the backtest data
         
-        for s_id, strat in self.strategies.items():
-            calc_acc, spec_acc, msg = strat.run_backtest_verification()
-            diff = abs(calc_acc - spec_acc)
-            
-            if diff > 5.0:
-                logger.error(f"[ALARM] Strategy {s_id} FAILED validation! {msg}")
-                alarm_triggered = True
-            else:
-                logger.info(f"[PASS] Strategy {s_id}: {msg}")
-                
-        if alarm_triggered:
-            logger.critical("One or more strategies failed accuracy validation (>5% deviation). Exiting safely.")
-            sys.exit(1)
+        logger.info("Fetching fresh live data (Last 2000 candles)...")
+        self._fetch_live_data() 
+        
+        logger.info("Populating strategy maps with fresh data...")
+        self._populate_all_strategies_for_live()
+        
+        logger.info("Initialization Complete. Bot is ready.")
 
     def _fetch_instrument_specs(self):
         try:
@@ -494,16 +377,16 @@ class Octopus:
                     
                     asset = data.get('asset')
                     tf = data.get('timeframe')
-                    acc = data.get('combined_accuracy', 0) # Expected accuracy
-                    
+                    acc = data.get('combined_accuracy', 0)
+                    trade_count = data.get('trade_count', 0)
+
                     if acc < 60.0:
-                        logger.warning(f"Skipping {asset} {tf} (Acc {acc:.2f}%)")
                         continue
                     
                     strategy_union = data.get('strategy_union', [])
                     if not strategy_union: continue
 
-                    ens = EnsembleStrategy(asset, tf, strategy_union, acc)
+                    ens = EnsembleStrategy(asset, tf, strategy_union, expected_acc=acc, expected_trades=trade_count)
                     self.strategies[ens.id] = ens
                     count += 1
             
@@ -513,59 +396,84 @@ class Octopus:
         except Exception as e:
             logger.error(f"Failed to load strategies: {e}")
 
-    def _fetch_initial_data(self):
+    def _fetch_verification_data(self):
+        """
+        Fetches specific history window: 2020-01-01 to 2026-01-01
+        Used strictly for verifying that the loaded strategies match their metadata.
+        """
+        start_ts = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        end_ts = int(datetime(2026, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        
         active_assets = set(s.asset for s in self.strategies.values())
-        logger.info(f"Fetching history for {len(active_assets)} assets (Since 2020)...")
-        start_timestamp_2020 = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
         
         for asset in active_assets:
             try:
                 url = "https://api.binance.com/api/v3/klines"
                 all_candles = []
-                current_start = start_timestamp_2020
+                current_start = start_ts
                 
+                while True:
+                    if current_start >= end_ts: break
+                    
+                    params = {
+                        "symbol": asset, 
+                        "interval": "15m", 
+                        "limit": 1000, 
+                        "startTime": current_start,
+                        "endTime": end_ts
+                    }
+                    r = requests.get(url, params=params)
+                    data = r.json()
+                    if not data or not isinstance(data, list) or len(data) == 0: break
+                    
+                    all_candles.extend(data)
+                    
+                    last_close = int(data[-1][6])
+                    current_start = last_close + 1
+                    time.sleep(0.05)
+                
+                self.price_history[asset] = [(int(x[6]), float(x[4])) for x in all_candles]
+                logger.info(f"[Verification Data] {asset}: Loaded {len(all_candles)} candles (2020-2026).")
+            except Exception as e:
+                logger.error(f"Verification data fetch error {asset}: {e}")
+
+    def _fetch_live_data(self):
+        """
+        Fetches the MOST RECENT data (Last 2000 15m candles).
+        This ignores the 2020-2026 hard limit and gets 'Fresh' data for live execution.
+        """
+        active_assets = set(s.asset for s in self.strategies.values())
+        
+        for asset in active_assets:
+            try:
+                url = "https://api.binance.com/api/v3/klines"
+                all_candles = []
+                # Fetch last 2000 candles approx (2 calls of 1000)
+                # We do this by not setting endTime, just standard backward fill or forward from a calculated start
+                # Easier: Get latest, then get previous.
+                
+                # Method: standard walk forward from (Now - 2000 * 15min)
+                start_ts = int((datetime.now(timezone.utc) - timedelta(minutes=15*2500)).timestamp() * 1000)
+                
+                current_start = start_ts
                 while True:
                     params = {"symbol": asset, "interval": "15m", "limit": 1000, "startTime": current_start}
                     r = requests.get(url, params=params)
                     data = r.json()
-                    if not data or not isinstance(data, list): break
+                    if not data or not isinstance(data, list) or len(data) == 0: break
+                    
                     all_candles.extend(data)
+                    last_close = int(data[-1][6])
+                    current_start = last_close + 1
+                    
+                    # Stop if we are at current time
                     if len(data) < 1000: break
-                    current_start = int(data[-1][6]) + 1
                     time.sleep(0.05)
                 
                 self.price_history[asset] = [(int(x[6]), float(x[4])) for x in all_candles]
-                logger.info(f"Loaded {len(all_candles)} candles for {asset}")
+                logger.info(f"[Live Data] {asset}: Loaded {len(all_candles)} FRESH candles.")
             except Exception as e:
-                logger.error(f"Data fetch error {asset}: {e}")
-
-    def _train_all_strategies(self):
-        """
-        Trains strategies on a FIXED dataset (2020-01-01 to TRAINING_END_DATE).
-        This prevents data drift and ensures '70% split' is always the same.
-        """
-        logger.info("Training Ensemble Strategies (One-time Init)...")
-        
-        # Convert fixed end date to timestamp
-        end_dt = datetime.strptime(TRAINING_END_DATE, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        end_ts = int(end_dt.timestamp() * 1000)
-        
-        for strat in self.strategies.values():
-            raw = self.price_history[strat.asset]
-            if not raw: continue
-            
-            # TRUNCATE DATA strictly for training
-            training_data_raw = [x for x in raw if x[0] <= end_ts]
-            
-            # If we don't have enough data to reach the end date, warn but proceed with what we have
-            if not training_data_raw:
-                logger.warning(f"No data found for {strat.asset} before {TRAINING_END_DATE}")
-                continue
-                
-            logger.info(f"Training {strat.id} on {len(training_data_raw)} candles (<= {TRAINING_END_DATE})")
-            
-            prices = self._resample(training_data_raw, strat.timeframe)
-            strat.train(prices)
+                logger.error(f"Live data fetch error {asset}: {e}")
 
     def _resample(self, raw_data: List[Tuple[int, float]], timeframe: str) -> List[float]:
         if timeframe == "15m": return [x[1] for x in raw_data]
@@ -576,6 +484,91 @@ class Octopus:
         target = tf_map.get(timeframe)
         if not target: return [x[1] for x in raw_data]
         return df['price'].resample(target).last().dropna().tolist()
+
+    # --- VERIFICATION LOGIC ---
+    def verify_strategies(self):
+        """
+        Splits the 2020-2026 data: 70% Train (Populate Maps), 30% Test.
+        """
+        logger.info("Verifying strategies on 2020-2026 history (70/30 Split)...")
+        
+        for strat_id, strat in self.strategies.items():
+            raw = self.price_history[strat.asset]
+            if not raw: continue
+            
+            full_prices = self._resample(raw, strat.timeframe)
+            if len(full_prices) < 100: continue
+
+            # 70% Split Index
+            split_idx = int(len(full_prices) * 0.7)
+            
+            # 1. Populate Maps using ONLY the first 70%
+            # This simulates the state of the model at the start of the 'Test' phase
+            strat.populate_maps(full_prices, train_limit_idx=split_idx)
+            
+            # 2. Walk-Forward Prediction on the remaining 30%
+            correct = 0
+            total_trades = 0
+            
+            # Predict for i, using info up to i-1
+            for i in range(split_idx, len(full_prices)):
+                current_price = full_prices[i]
+                prev_price = full_prices[i-1]
+                
+                # Context window for prediction
+                window_start = max(0, i - 50)
+                recent_window = full_prices[window_start:i] 
+                
+                signal = strat.predict(recent_window)
+                
+                if signal == 0: continue
+                
+                diff = current_price - prev_price
+                threshold = strat.min_bucket_size
+                
+                if abs(diff) < threshold:
+                    continue # Flat/Ignored
+                
+                total_trades += 1
+                is_correct = False
+                if signal == 1 and diff > 0: is_correct = True
+                elif signal == -1 and diff < 0: is_correct = True
+                
+                if is_correct: correct += 1
+                
+            calc_acc = (correct / total_trades * 100) if total_trades > 0 else 0.0
+            exp_acc = strat.expected_accuracy
+            exp_trades = strat.expected_trades
+            
+            logger.info(f"[{strat_id}] Test: Acc={calc_acc:.2f}% (Exp: {exp_acc}%) | Trades={total_trades} (Exp: {exp_trades})")
+            
+            fail = False
+            if abs(calc_acc - exp_acc) > 5.0:
+                logger.error(f"[{strat_id}] ACCURACY MISMATCH! {calc_acc:.2f} vs {exp_acc}")
+                fail = True
+            
+            if exp_trades > 0:
+                trade_dev = abs(total_trades - exp_trades) / exp_trades
+                if trade_dev > 0.05:
+                    logger.error(f"[{strat_id}] TRADE COUNT MISMATCH! {total_trades} vs {exp_trades}")
+                    fail = True
+            
+            if fail:
+                logger.critical(f"STOPPING: Strategy {strat_id} failed verification.")
+                sys.exit(1)
+
+        logger.info("--- VERIFICATION PASSED ---")
+
+    def _populate_all_strategies_for_live(self):
+        """
+        Populates maps using ALL available fresh data (no split).
+        """
+        for strat in self.strategies.values():
+            raw = self.price_history[strat.asset]
+            if not raw: continue
+            prices = self._resample(raw, strat.timeframe)
+            # Use entire dataset for map population
+            strat.populate_maps(prices, train_limit_idx=None)
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
@@ -615,14 +608,12 @@ class Octopus:
             if not isinstance(data, list): return
 
             last_stored_ts = self.price_history[asset][-1][0]
-            
             for candle in data:
                 open_ts = int(candle[0])
                 close_ts = int(candle[6])
                 price = float(candle[4])
                 if close_ts > last_stored_ts and open_ts < limit_ts:
                     self.price_history[asset].append((close_ts, price))
-            
             if len(self.price_history[asset]) > 5000:
                 self.price_history[asset] = self.price_history[asset][-5000:]
         except Exception as e:
@@ -637,7 +628,6 @@ class Octopus:
         futures = []
         for asset in active_assets:
             futures.append(self.executor.submit(self._update_single_asset, asset, limit_ts))
-        
         for f in futures: f.result()
         logger.info("Data update complete.")
 
@@ -664,17 +654,9 @@ class Octopus:
 
         is_marathon = any(tf in ["60m", "240m", "1d"] for tf in active_tfs)
         if is_marathon:
-            exec_duration = 300
-            exec_interval = 10
-            start_offset_bp = -5 
-            step_bp = 0.5 
-            mode_name = "MARATHONER"
+            exec_duration, exec_interval, start_offset_bp, step_bp, mode_name = 300, 10, -5, 0.5, "MARATHONER"
         else:
-            exec_duration = 60
-            exec_interval = 5
-            start_offset_bp = 0 
-            step_bp = 1.0 
-            mode_name = "SPRINTER"
+            exec_duration, exec_interval, start_offset_bp, step_bp, mode_name = 60, 5, 0, 1.0, "SPRINTER"
 
         logger.info(f"Execution Mode: {mode_name}")
         active_assets = set()
@@ -683,15 +665,12 @@ class Octopus:
             if strat.timeframe in active_tfs:
                 active_assets.add(strat.asset)
                 raw = self.price_history[strat.asset]
-                # RESAMPLE FULL HISTORY (Including live data > 2026-01-01)
                 prices = self._resample(raw, strat.timeframe)
                 current_price = prices[-1] if prices else 0.0
-
                 self.tracker.evaluate(strat.id, current_price)
                 strat.virtual_position = 0.0
                 sig = strat.predict(prices)
                 self.tracker.record_prediction(strat.id, sig, current_price, strat.min_bucket_size)
-
                 strat.virtual_position = sig * unit_size_usd
                 logger.info(f"Strat {strat.id}: Signal {sig} | Alloc: ${strat.virtual_position:.2f}")
 
@@ -699,20 +678,12 @@ class Octopus:
         for f in f_sigs: f.result()
 
         for asset in active_assets:
-            self.executor.submit(
-                self._execute_single_asset_logic, 
-                asset, 
-                exec_duration, 
-                exec_interval, 
-                start_offset_bp, 
-                step_bp
-            )
+            self.executor.submit(self._execute_single_asset_logic, asset, exec_duration, exec_interval, start_offset_bp, step_bp)
 
     def _execute_single_asset_logic(self, binance_asset: str, duration: int, interval: int, start_bp: float, step_bp: float):
         kf_symbol = SYMBOL_MAP.get(binance_asset)
         if not kf_symbol: return
         net_target_usd = sum(s.virtual_position for s in self.strategies.values() if s.asset == binance_asset)
-
         try:
             open_pos = self.kf.get_open_positions()
             current_pos_size = 0.0
@@ -723,29 +694,21 @@ class Octopus:
                         if p["side"] == "short": size = -size
                         current_pos_size = size
                         break
-            
             tickers = self.kf.get_tickers()
             mark_price = 0.0
             for t in tickers.get("tickers", []):
                 if t["symbol"].lower() == kf_symbol.lower():
                     mark_price = float(t["markPrice"])
                     break
-            
             if mark_price == 0: return
-            
             target_contracts = net_target_usd / mark_price
             delta = target_contracts - current_pos_size
             specs = self.instrument_specs.get(kf_symbol.lower())
             size_increment = specs['sizeStep'] if specs else 0.001
             check_qty = self._round_to_step(abs(delta), size_increment)
-
-            if check_qty < size_increment: 
-                logger.info(f"[{kf_symbol}] Delta {delta:.4f} too small (Min: {size_increment}). Holding.")
-                return
-
+            if check_qty < size_increment: return
             logger.info(f"[{kf_symbol}] Executing Delta: {delta:.4f} (Target: ${net_target_usd:.2f})")
             self._run_maker_loop(kf_symbol, delta, mark_price, duration, interval, start_bp, step_bp)
-
         except Exception as e:
             logger.error(f"[{kf_symbol}] Exec Error: {e}")
 
@@ -756,7 +719,6 @@ class Octopus:
         specs = self.instrument_specs.get(symbol.lower())
         size_inc = specs['sizeStep'] if specs else 0.001
         price_inc = specs['tickSize'] if specs else 0.01
-
         steps = max_duration // interval
         order_id = None
         
@@ -772,10 +734,7 @@ class Octopus:
                 
                 current_aggression_bp = start_offset_bp + (i * step_bp)
                 pct_change = current_aggression_bp * 0.0001
-                
-                if side == "buy": final_limit = curr_mark * (1 + pct_change)
-                else: final_limit = curr_mark * (1 - pct_change)
-
+                final_limit = curr_mark * (1 + pct_change) if side == "buy" else curr_mark * (1 - pct_change)
                 final_limit = self._round_to_step(final_limit, price_inc)
                 final_size = self._round_to_step(abs_qty, size_inc)
                 
@@ -795,12 +754,10 @@ class Octopus:
                         "size": final_size, "symbol": symbol 
                     })
                     logger.info(f"[{symbol}] Adjusted @ {final_limit} ({current_aggression_bp}bp)")
-                
                 time.sleep(interval)
             except Exception as e:
                 logger.error(f"[{symbol}] Maker Loop Error: {e}")
                 time.sleep(1)
-        
         if order_id:
             try:
                 self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
