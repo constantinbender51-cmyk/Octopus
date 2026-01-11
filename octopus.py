@@ -1,35 +1,28 @@
 #!/usr/bin/env python3
 """
-Octopus: Multi-Strategy Aggregator & Execution Engine for Kraken Futures.
-Updated for 'Strategy Union' (Pre-trained JSONs).
-- FIX: Deserializes JSON string keys back to Integers (Fixes TypeError).
-- NO Retraining (loads maps directly from JSON).
-- Fast Startup (fetches only recent context).
-- PARALLEL EXECUTION.
-- ROBUST LOADING (Skips bad JSONs).
+Octopus: Remote Signal Aggregator & Execution Engine.
+Fetches signals from 'https://octopus-feed.up.railway.app/'
+- REMOVED: Local Training, JSON loading, Pandas Resampling.
+- ADDED: HTML Scraping, Signal Parsing.
+- RETAINED: Kraken Futures Execution, Maker Loop, Risk Management.
 """
 
 import os
 import sys
 import time
-import json
-import base64
+import re
 import logging
-import threading
 import requests
-import pandas as pd
-import random
 from datetime import datetime, timezone
-from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # --- Local Imports ---
 try:
     from kraken_futures import KrakenFuturesApi
     import stress_test
 except ImportError as e:
-    print(f"CRITICAL: Import failed: {e}. Ensure 'kraken_futures.py' and 'stress_test.py' are in the directory.")
+    print(f"CRITICAL: Import failed: {e}. Ensure 'kraken_futures.py' is in the directory.")
     sys.exit(1)
 
 # --- Configuration ---
@@ -42,17 +35,14 @@ except ImportError:
 # API Keys
 KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
-GITHUB_PAT = os.getenv("PAT")
 
 # Global Settings
 LEVERAGE = 2.0
-REPO_OWNER = "constantinbender51-cmyk"
-REPO_NAME = "Models"
-GITHUB_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/contents/"
+SIGNAL_FEED_URL = "https://octopus-feed.up.railway.app/"
 
-# Asset Mapping (Binance USDT -> Kraken Futures Perpetual)
+# Asset Mapping (Feed Symbol -> Kraken Futures Perpetual)
 SYMBOL_MAP = {
-    "BTCUSDT": "ff_xbtusd_260327",
+    "BTCUSDT": "ff_xbtusd_260327", # Changed from original to match your file
     "ETHUSDT": "pf_ethusd",
     "SOLUSDT": "pf_solusd",
     "BNBUSDT": "pf_bnbusd",
@@ -71,291 +61,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Octopus")
 
-# --- Performance Tracking Class ---
+# --- Signal Fetcher ---
 
-class PerformanceTracker:
-    def __init__(self):
-        self.stats = defaultdict(lambda: {"correct": 0, "total": 0, "accuracy": 0.0})
-        self.last_predictions = {} 
-        self.lock = threading.Lock()
+class SignalFetcher:
+    def __init__(self, url):
+        self.url = url
+        # Regex to find the main table rows
+        self.row_pattern = re.compile(r"<tr>\s*<td>(.*?)</td>(.*?)</tr>", re.DOTALL)
+        # Regex to find cells within a row
+        self.cell_pattern = re.compile(r"<td class='(.*?)'>(.*?)</td>", re.DOTALL)
 
-    def evaluate(self, strat_id: str, current_price: float):
-        """Compares the LAST prediction against the CURRENT price."""
-        with self.lock:
-            if strat_id not in self.last_predictions:
-                return
-
-            last = self.last_predictions[strat_id]
-            last_signal = last["signal"]
-            last_price = last["price"]
-            threshold = last.get("threshold", 0.0)
-            
-            del self.last_predictions[strat_id]
-
-            if last_signal == 0:
-                return 
-
-            price_diff = current_price - last_price
-
-            # 1. Check if outcome is FLAT (Small movement)
-            if abs(price_diff) < threshold:
-                return 
-
-            # 2. Outcome is Directional (Big movement)
-            is_correct = False
-            
-            if last_signal == 1: # Predicted UP
-                if price_diff > 0: is_correct = True
-            elif last_signal == -1: # Predicted DOWN
-                if price_diff < 0: is_correct = True
-
-            self.stats[strat_id]["total"] += 1
-            if is_correct:
-                self.stats[strat_id]["correct"] += 1
-            
-            total = self.stats[strat_id]["total"]
-            corr = self.stats[strat_id]["correct"]
-            self.stats[strat_id]["accuracy"] = round((corr / total) * 100, 2)
-
-    def record_prediction(self, strat_id: str, signal: int, current_price: float, threshold: float):
-        with self.lock:
-            self.last_predictions[strat_id] = {
-                "signal": signal,
-                "price": current_price,
-                "ts": int(time.time()),
-                "threshold": threshold
-            }
-
-    def upload_to_github(self):
-        if not GITHUB_PAT: return
+    def fetch_signals(self) -> Dict[str, int]:
+        """
+        Scrapes the website and returns a dictionary of Net Votes per Asset.
+        Returns: { "BTCUSDT": 2, "ETHUSDT": -1, ... }
+        Also returns the total count of strategies (cells) found for sizing.
+        """
         try:
-            content_str = json.dumps(self.stats, indent=2)
-            content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
-            
-            url = f"{GITHUB_API_URL}performance.json"
-            headers = {"Authorization": f"Bearer {GITHUB_PAT}"}
-            
-            sha = None
-            try:
-                get_resp = requests.get(url, headers=headers)
-                if get_resp.status_code == 200:
-                    sha = get_resp.json().get("sha")
-            except: pass
+            logger.info(f"Fetching signals from {self.url}...")
+            resp = requests.get(self.url, timeout=10)
+            resp.raise_for_status()
+            html = resp.text
 
-            data = {
-                "message": f"Update performance stats {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-                "content": content_b64
-            }
-            if sha: data["sha"] = sha
+            # Parse Table
+            matches = self.row_pattern.findall(html)
             
-            requests.put(url, headers=headers, json=data)
-            logger.info("Performance stats uploaded to GitHub.")
-        except Exception as e:
-            logger.error(f"Failed to upload performance stats: {e}")
+            asset_votes = {}
+            total_strategies = 0
 
-# --- Strategy Logic Classes ---
-
-class SubStrategy:
-    """
-    Represents a single model configuration (one item in 'strategy_union').
-    Now loads Pre-Trained Maps directly from JSON.
-    """
-    def __init__(self, strategy_data: dict):
-        config = strategy_data.get('config', {})
-        params = strategy_data.get('trained_parameters', {})
-        
-        self.model_type = config.get('model_type', 'Absolute')
-        
-        # Load Parameters directly
-        self.bucket_size = params.get('bucket_size', 1.0)
-        self.seq_len = params.get('seq_len', 3)
-        self.all_vals = params.get('all_vals', [])
-        self.all_changes = params.get('all_changes', [])
-        
-        # Deserialize Maps (String Key -> Tuple Key)
-        self.abs_map = self._deserialize_map(params.get('abs_map', {}))
-        self.der_map = self._deserialize_map(params.get('der_map', {}))
-
-    def _deserialize_map(self, serialized_map: dict) -> dict:
-        """
-        Converts JSON keys '1|2|3' back to tuples (1, 2, 3).
-        CRITICAL: Converts inner dictionary keys (predictions) from String to Int.
-        """
-        deserialized = {}
-        for k, v in serialized_map.items():
-            if k == "":
-                tuple_key = ()
-            else:
-                try:
-                    tuple_key = tuple(int(x) for x in k.split("|"))
-                except ValueError:
-                    continue 
-            
-            # CRITICAL FIX: Convert inner dict keys from 'str' to 'int'
-            # JSON stores { "5": 10 }, we need { 5: 10 }
-            inner_counter = Counter()
-            for inner_k, inner_v in v.items():
-                try:
-                    inner_counter[int(inner_k)] = inner_v
-                except ValueError:
+            for asset_name, cells_html in matches:
+                if asset_name not in SYMBOL_MAP:
                     continue
+
+                cells = self.cell_pattern.findall(cells_html)
+                net_vote = 0
+                
+                for cls, txt in cells:
+                    total_strategies += 1
+                    txt = txt.strip().upper()
                     
-            deserialized[tuple_key] = inner_counter
-            
-        return deserialized
+                    if "BUY" in txt:
+                        net_vote += 1
+                    elif "SELL" in txt:
+                        net_vote -= 1
+                    # WAIT/NEUTRAL is 0
 
-    def _get_bucket(self, price: float) -> int:
-        bs = self.bucket_size
-        if bs <= 0: bs = 1e-9
-        if price >= 0:
-            return int(price // bs)
-        else:
-            return int(price // bs) - 1
+                asset_votes[asset_name] = net_vote
+            
+            logger.info(f"Parsed {total_strategies} total strategy cells.")
+            return asset_votes, total_strategies
 
-    def get_prediction_value(self, recent_prices: List[float]) -> int:
-        """
-        Returns the predicted BUCKET VALUE.
-        Queries the pre-loaded maps using the LIVE recent sequence.
-        """
-        if len(recent_prices) < self.seq_len + 1:
-            return self._get_bucket(recent_prices[-1]) if recent_prices else 0
-            
-        buckets = [self._get_bucket(p) for p in recent_prices]
-        
-        # Extract the sequence window from recent history
-        window = buckets[-(self.seq_len + 1):] 
-        
-        a_seq = tuple(window[1:]) 
-        if self.seq_len > 1:
-            d_seq = tuple(a_seq[k] - a_seq[k-1] for k in range(1, len(a_seq)))
-        else:
-            d_seq = ()
-            
-        last_val = window[-1]
-        
-        # Prediction Logic
-        if self.model_type == "Absolute":
-            if a_seq in self.abs_map:
-                # Returns INT now, thanks to fix in _deserialize_map
-                return self.abs_map[a_seq].most_common(1)[0][0]
-            return random.choice(self.all_vals) if self.all_vals else last_val
-            
-        elif self.model_type == "Derivative":
-            if d_seq in self.der_map:
-                # Returns INT
-                change = self.der_map[d_seq].most_common(1)[0][0]
-                return last_val + change
-            change = random.choice(self.all_changes) if self.all_changes else 0
-            return last_val + change
-            
-        elif self.model_type == "Combined":
-            abs_cand = self.abs_map.get(a_seq, Counter())
-            der_cand = self.der_map.get(d_seq, Counter())
-            poss = set(abs_cand.keys())
-            for c in der_cand.keys(): poss.add(last_val + c)
-            
-            if not poss: 
-                return random.choice(self.all_vals) if self.all_vals else last_val
-            
-            best, max_s = last_val, -1
-            for v in poss:
-                s = abs_cand[v] + der_cand[v - last_val]
-                if s > max_s: max_s, best = s, v
-            return best
-            
-        return last_val
-
-class EnsembleStrategy:
-    """
-    Holds the 'Strategy Union' for a specific Asset/Timeframe.
-    Aggregates predictions using Majority Vote.
-    """
-    def __init__(self, asset: str, timeframe: str, strategy_union: List[dict]):
-        self.asset = asset
-        self.timeframe = timeframe
-        self.id = f"{asset}_{timeframe}"
-        self.virtual_position = 0.0
-        
-        self.sub_strategies = []
-        for s_data in strategy_union:
-             if 'config' in s_data and 'trained_parameters' in s_data:
-                 self.sub_strategies.append(SubStrategy(s_data))
-        
-        if self.sub_strategies:
-            self.min_bucket_size = min(s.bucket_size for s in self.sub_strategies)
-        else:
-            self.min_bucket_size = 0.0
-            
-    def predict(self, recent_prices: List[float]) -> int:
-        """
-        Returns Aggregated Signal: 1 (Buy), -1 (Sell), 0 (Flat).
-        Logic: Majority Vote.
-        """
-        if not recent_prices: return 0
-        if not self.sub_strategies: return 0
-        
-        votes = []
-        
-        for strat in self.sub_strategies:
-            # 1. Get Predicted Bucket
-            pred_bucket = strat.get_prediction_value(recent_prices)
-            
-            # 2. Compare to Current Bucket
-            current_bucket = strat._get_bucket(recent_prices[-1])
-            
-            # Check for type mismatch if fix failed
-            if isinstance(pred_bucket, str):
-                logger.error(f"FATAL: pred_bucket is string '{pred_bucket}' in {self.id}")
-                continue
-
-            diff = pred_bucket - current_bucket
-            
-            if diff > 0: votes.append(1)
-            elif diff < 0: votes.append(-1)
-            else: votes.append(0)
-            
-        up_votes = votes.count(1)
-        down_votes = votes.count(-1)
-        flat_votes = votes.count(0)
-        
-        signal = 0
-        if up_votes > down_votes:
-            signal = 1
-        elif down_votes > up_votes:
-            signal = -1
-        else:
-            signal = 0
-
-        logger.info(f"[{self.id}] Decision: +{up_votes} / -{down_votes} / ={flat_votes} => Signal: {signal}")
-        return signal
+        except Exception as e:
+            logger.error(f"Failed to fetch signals: {e}")
+            return {}, 0
 
 # --- Main Octopus Engine ---
 
 class Octopus:
     def __init__(self):
         self.kf = KrakenFuturesApi(KF_KEY, KF_SECRET)
-        self.strategies: Dict[str, EnsembleStrategy] = {}
-        self.price_history: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
-        self.executor = ThreadPoolExecutor(max_workers=None)
-        self.total_strategies_count = 0
+        self.fetcher = SignalFetcher(SIGNAL_FEED_URL)
+        self.executor = ThreadPoolExecutor(max_workers=5)
         self.instrument_specs = {}
-        self.tracker = PerformanceTracker()
 
     def initialize(self):
-        logger.info("Initializing Octopus (Pre-trained Loading)...")
+        logger.info("Initializing Octopus (Remote Feed Mode)...")
         self._fetch_instrument_specs()
         
-        # Stress Test
-        logger.info("Executing Startup Stress Test...")
+        # Stress Test (Optional, keeps connection warm)
+        logger.info("Checking API Connection...")
         try:
-            stress_test.run_stress_test(
-                self.kf, SYMBOL_MAP, LEVERAGE, REPO_OWNER, REPO_NAME, GITHUB_PAT
-            )
+            acc = self.kf.get_accounts()
+            if "error" in acc:
+                logger.error(f"API Error: {acc}")
+            else:
+                logger.info("API Connection Successful.")
         except Exception as e:
-            logger.error(f"Stress test failed/skipped: {e}")
+            logger.error(f"API Connection Failed: {e}")
 
-        self._load_strategies_from_github()
-        self._fetch_recent_context()
         logger.info("Initialization Complete. Bot ready.")
 
     def _fetch_instrument_specs(self):
@@ -377,83 +160,6 @@ class Octopus:
         except Exception as e:
             logger.error(f"Error fetching specs: {e}")
 
-    def _load_strategies_from_github(self):
-        if not GITHUB_PAT:
-            logger.error("No GitHub PAT found.")
-            return
-
-        headers = {"Authorization": f"Bearer {GITHUB_PAT}"}
-        try:
-            resp = requests.get(GITHUB_API_URL, headers=headers)
-            resp.raise_for_status()
-            files = resp.json()
-            
-            count = 0
-            for f in files:
-                try:
-                    if f['name'].endswith(".json") and f['name'] != "performance.json":
-                        content_resp = requests.get(f['download_url'])
-                        data = content_resp.json()
-                        
-                        asset = data.get('asset')
-                        tf = data.get('timeframe')
-                        
-                        if not asset or not tf: continue
-
-                        acc = data.get('combined_accuracy', 0)
-                        if acc < 60.0:
-                            logger.warning(f"Skipping {asset} {tf} (Acc {acc:.2f}%)")
-                            continue
-                        
-                        strategy_union = data.get('strategy_union', [])
-                        if not strategy_union: continue
-
-                        ens = EnsembleStrategy(asset, tf, strategy_union)
-                        if not ens.sub_strategies: continue
-                            
-                        self.strategies[ens.id] = ens
-                        count += 1
-                        
-                except Exception as inner_e:
-                    logger.error(f"Failed to load file {f.get('name')}: {inner_e}")
-                    continue
-            
-            self.total_strategies_count = count
-            logger.info(f"Loaded {count} Ensemble Strategies.")
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch file list from GitHub: {e}")
-
-    def _fetch_recent_context(self):
-        active_assets = set(s.asset for s in self.strategies.values())
-        logger.info(f"Fetching recent context for {len(active_assets)} assets...")
-        
-        for asset in active_assets:
-            try:
-                url = "https://api.binance.com/api/v3/klines"
-                params = {"symbol": asset, "interval": "15m", "limit": 500}
-                r = requests.get(url, params=params)
-                data = r.json()
-                
-                if isinstance(data, list) and len(data) > 0:
-                    self.price_history[asset] = [(int(x[6]), float(x[4])) for x in data]
-                    logger.info(f"[{asset}] Context Loaded: {len(data)} candles.")
-                else:
-                    logger.warning(f"[{asset}] No data returned.")
-                time.sleep(0.1)
-            except Exception as e:
-                logger.error(f"Context fetch error {asset}: {e}")
-
-    def _resample(self, raw_data: List[Tuple[int, float]], timeframe: str) -> List[float]:
-        if timeframe == "15m": return [x[1] for x in raw_data]
-        df = pd.DataFrame(raw_data, columns=['ts', 'price'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-        df.set_index('ts', inplace=True)
-        tf_map = {"30m": "30min", "60m": "1h", "240m": "4h", "1d": "1D"}
-        target = tf_map.get(timeframe)
-        if not target: return [x[1] for x in raw_data]
-        return df['price'].resample(target).last().dropna().tolist()
-
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
         rounded = round(value / step) * step
@@ -465,63 +171,29 @@ class Octopus:
         return rounded
 
     def run(self):
-        logger.info("Bot started. Waiting for next 15m mark + 5s...")
+        logger.info("Bot started. Syncing with 15m intervals...")
         while True:
             now = datetime.now(timezone.utc)
             
-            if now.minute % 15 == 0 and 5 <= now.second < 10:
+            # Trigger every 15 minutes at second 10 (giving server time to update)
+            if now.minute % 15 == 0 and 10 <= now.second < 15:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 
-                tfs_to_run = ["15m"]
-                if now.minute == 0 or now.minute == 30: tfs_to_run.append("30m")
-                if now.minute == 0:
-                    tfs_to_run.append("60m")
-                    if now.hour % 4 == 0: tfs_to_run.append("240m")
-                    if now.hour == 0: tfs_to_run.append("1d")
+                self._process_signals()
                 
-                self._update_all_data_parallel()
-                self._process_strategies_parallel(tfs_to_run)
-                self.executor.submit(self.tracker.upload_to_github)
+                time.sleep(50) # Prevent double trigger
                 
-                time.sleep(50)
-                
-            time.sleep(0.1) 
+            time.sleep(1) 
 
-    def _update_single_asset(self, asset: str, limit_ts: int):
-        try:
-            params = {"symbol": asset, "interval": "15m", "limit": 5}
-            r = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=5)
-            data = r.json()
-            if not isinstance(data, list): return
-
-            last_stored_ts = self.price_history[asset][-1][0] if self.price_history[asset] else 0
-            
-            for candle in data:
-                open_ts = int(candle[0])
-                close_ts = int(candle[6])
-                price = float(candle[4])
-                if close_ts > last_stored_ts and open_ts < limit_ts:
-                    self.price_history[asset].append((close_ts, price))
-                    
-            if len(self.price_history[asset]) > 2000:
-                self.price_history[asset] = self.price_history[asset][-2000:]
-        except Exception as e:
-            logger.error(f"Update failed for {asset}: {e}")
-
-    def _update_all_data_parallel(self):
-        now = datetime.now(timezone.utc)
-        current_interval_start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
-        limit_ts = int(current_interval_start.timestamp() * 1000)
-
-        active_assets = set(s.asset for s in self.strategies.values())
-        futures = []
-        for asset in active_assets:
-            futures.append(self.executor.submit(self._update_single_asset, asset, limit_ts))
+    def _process_signals(self):
+        # 1. Fetch Signals
+        asset_votes, total_strategies = self.fetcher.fetch_signals()
         
-        for f in futures: f.result()
-        logger.info("Data update complete.")
+        if total_strategies == 0:
+            logger.warning("No strategies found on feed. Skipping execution.")
+            return
 
-    def _process_strategies_parallel(self, active_tfs: List[str]):
+        # 2. Get Account Equity
         try:
             acc = self.kf.get_accounts()
             if "flex" in acc.get("accounts", {}):
@@ -539,63 +211,39 @@ class Octopus:
             logger.error(f"Account fetch failed: {e}")
             return
 
-        if self.total_strategies_count == 0: return
-        unit_size_usd = (equity * LEVERAGE) / self.total_strategies_count
-        logger.info(f"Equity: ${equity:.2f} | Unit: ${unit_size_usd:.2f} | TFs: {active_tfs}")
+        # 3. Calculate Unit Size
+        # Formula: (Equity * Leverage) / Total Cells in Matrix
+        unit_size_usd = (equity * LEVERAGE) / total_strategies
+        logger.info(f"Equity: ${equity:.2f} | Strategies: {total_strategies} | Unit: ${unit_size_usd:.2f}")
 
-        is_marathon = any(tf in ["60m", "240m", "1d"] for tf in active_tfs)
-        
-        if is_marathon:
-            exec_duration = 300
-            exec_interval = 10
-            start_offset_bp = -5 
-            step_bp = 0.5 
-            mode_name = "MARATHONER"
-        else:
-            exec_duration = 60
-            exec_interval = 5
-            start_offset_bp = 0 
-            step_bp = 1.0 
-            mode_name = "SPRINTER"
+        # 4. Execute per Asset
+        # Use Sprint settings (faster execution) as this is a reactive update
+        exec_duration = 60
+        exec_interval = 5
+        start_offset_bp = 0 
+        step_bp = 1.0 
 
-        logger.info(f"Execution Mode: {mode_name}")
-
-        active_assets = set()
-        
-        def calc_signal(strat):
-            if strat.timeframe in active_tfs:
-                active_assets.add(strat.asset)
-                raw = self.price_history[strat.asset]
-                prices = self._resample(raw, strat.timeframe)
-                current_price = prices[-1] if prices else 0.0
-
-                self.tracker.evaluate(strat.id, current_price)
-                sig = strat.predict(prices)
-                self.tracker.record_prediction(strat.id, sig, current_price, strat.min_bucket_size)
-
-                strat.virtual_position = sig * unit_size_usd
-                logger.info(f"Strat {strat.id}: Signal {sig} | Alloc: ${strat.virtual_position:.2f}")
-
-        f_sigs = [self.executor.submit(calc_signal, s) for s in self.strategies.values()]
-        for f in f_sigs: f.result()
-
-        for asset in active_assets:
+        for asset, net_vote in asset_votes.items():
+            target_usd = net_vote * unit_size_usd
+            logger.info(f"[{asset}] Net Vote: {net_vote} -> Target Alloc: ${target_usd:.2f}")
+            
             self.executor.submit(
                 self._execute_single_asset_logic, 
                 asset, 
+                target_usd,
                 exec_duration, 
                 exec_interval, 
                 start_offset_bp, 
                 step_bp
             )
 
-    def _execute_single_asset_logic(self, binance_asset: str, duration: int, interval: int, start_bp: float, step_bp: float):
+    def _execute_single_asset_logic(self, binance_asset: str, net_target_usd: float, 
+                                    duration: int, interval: int, start_bp: float, step_bp: float):
         kf_symbol = SYMBOL_MAP.get(binance_asset)
         if not kf_symbol: return
 
-        net_target_usd = sum(s.virtual_position for s in self.strategies.values() if s.asset == binance_asset)
-
         try:
+            # Get Current Position
             open_pos = self.kf.get_open_positions()
             current_pos_size = 0.0
             if "openPositions" in open_pos:
@@ -606,6 +254,7 @@ class Octopus:
                         current_pos_size = size
                         break
             
+            # Get Mark Price
             tickers = self.kf.get_tickers()
             mark_price = 0.0
             for t in tickers.get("tickers", []):
@@ -615,6 +264,7 @@ class Octopus:
             
             if mark_price == 0: return
             
+            # Calculate Delta
             target_contracts = net_target_usd / mark_price
             delta = target_contracts - current_pos_size
             
@@ -623,10 +273,9 @@ class Octopus:
             check_qty = self._round_to_step(abs(delta), size_increment)
 
             if check_qty < size_increment: 
-                logger.info(f"[{kf_symbol}] Delta {delta:.4f} too small (Min: {size_increment}). Holding.")
                 return
 
-            logger.info(f"[{kf_symbol}] Executing Delta: {delta:.4f} (Target: ${net_target_usd:.2f})")
+            logger.info(f"[{kf_symbol}] Executing Delta: {delta:.4f} (Current: {current_pos_size:.4f} -> Target: {target_contracts:.4f})")
 
             self._run_maker_loop(kf_symbol, delta, mark_price, duration, interval, start_bp, step_bp)
 
