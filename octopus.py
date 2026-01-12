@@ -37,7 +37,7 @@ KF_KEY = os.getenv("KRAKEN_FUTURES_KEY")
 KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
-LEVERAGE = 2.0
+LEVERAGE = 70
 SIGNAL_FEED_URL = "https://octopus-feed.up.railway.app/"
 
 # Asset Mapping (Feed Symbol -> Kraken Futures Perpetual)
