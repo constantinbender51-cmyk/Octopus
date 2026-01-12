@@ -170,20 +170,19 @@ class Octopus:
             rounded = int(rounded)
         return rounded
 
-        def run(self):
+    def run(self):
         logger.info("Bot started. Syncing with 15m intervals...")
         while True:
             now = datetime.now(timezone.utc)
             
-            # CHANGED: Trigger window moved to 20s-25s to catch the signal 
-            # after the feed updates (which happens around ~12s).
+            # Trigger every 15 minutes at second 20 (giving server time to update)
+            # Changed from 10 <= now.second < 15 to 20 <= now.second < 25
             if now.minute % 15 == 0 and 20 <= now.second < 25:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 
                 self._process_signals()
                 
-                # Sleep to ensure we don't trigger multiple times within the same window
-                time.sleep(50) 
+                time.sleep(50) # Prevent double trigger
                 
             time.sleep(1) 
 
