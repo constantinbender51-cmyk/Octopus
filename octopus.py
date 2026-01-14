@@ -124,11 +124,11 @@ class Octopus:
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.instrument_specs = {}
 
-    def initialize(self):
+        def initialize(self):
         logger.info("Initializing Octopus (Remote Feed Mode)...")
         self._fetch_instrument_specs()
         
-        # Stress Test (Optional, keeps connection warm)
+        # --- Stress/Connection Test ---
         logger.info("Checking API Connection...")
         try:
             acc = self.kf.get_accounts()
@@ -139,26 +139,55 @@ class Octopus:
         except Exception as e:
             logger.error(f"API Connection Failed: {e}")
 
+        # --- SPECIAL BNB DIAGNOSTIC TEST ---
+        logger.info("--- DIAGNOSTIC: BNB TEST ORDER ---")
+        try:
+            # 1. Verify Symbol Mapping
+            test_symbol = SYMBOL_MAP.get("BNBUSDT", "pf_bnbusd") 
+            logger.info(f"Testing Symbol: {test_symbol}")
+
+            # 2. Get Price for Safe Limit
+            tickers = self.kf.get_tickers()
+            mark_price = 0.0
+            for t in tickers.get("tickers", []):
+                if t["symbol"].lower() == test_symbol.lower():
+                    mark_price = float(t["markPrice"])
+                    break
+            
+            if mark_price > 0:
+                safe_limit = round(mark_price * 0.5, 2) # 50% below market
+                
+                # 3. Construct Order (Size 0.1 is usually valid for BNB)
+                order_payload = {
+                    "orderType": "lmt", 
+                    "symbol": test_symbol, 
+                    "side": "buy",
+                    "size": 0.1, 
+                    "limitPrice": safe_limit
+                }
+                
+                logger.info(f"Sending Payload: {order_payload}")
+                
+                # 4. SEND AND PRINT RAW RESPONSE
+                resp = self.kf.send_order(order_payload)
+                logger.info(f"🛑 RAW API RESPONSE (BNB): {resp}")
+
+                # 5. Immediate Cleanup
+                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
+                    oid = resp["sendStatus"]["order_id"]
+                    logger.info(f"Order placed successfully (ID: {oid}). Cancelling now...")
+                    self.kf.cancel_order({"order_id": oid, "symbol": test_symbol})
+                else:
+                    logger.error("Order failed to place. Check the RAW RESPONSE above.")
+            else:
+                logger.error("Could not fetch Mark Price for BNB. Is the symbol correct?")
+
+        except Exception as e:
+            logger.error(f"BNB TEST EXCEPTION: {e}")
+        logger.info("--- DIAGNOSTIC COMPLETE ---")
+
         logger.info("Initialization Complete. Bot ready.")
 
-    def _fetch_instrument_specs(self):
-        try:
-            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
-            resp = requests.get(url).json()
-            if "instruments" in resp:
-                for inst in resp["instruments"]:
-                    sym = inst["symbol"].lower()
-                    tick_size = float(inst.get("tickSize", 0.1))
-                    precision = inst.get("contractValueTradePrecision")
-                    size_step = 10 ** (-int(precision)) if precision is not None else 1.0
-                    
-                    self.instrument_specs[sym] = {
-                        "sizeStep": size_step,
-                        "tickSize": tick_size,
-                        "contractSize": float(inst.get("contractSize", 1.0))
-                    }
-        except Exception as e:
-            logger.error(f"Error fetching specs: {e}")
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
