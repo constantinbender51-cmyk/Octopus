@@ -128,7 +128,7 @@ class Octopus:
         logger.info("Initializing Octopus (Remote Feed Mode)...")
         self._fetch_instrument_specs()
         
-        # --- Stress/Connection Test ---
+        # Stress Test (Optional, keeps connection warm)
         logger.info("Checking API Connection...")
         try:
             acc = self.kf.get_accounts()
@@ -138,54 +138,6 @@ class Octopus:
                 logger.info("API Connection Successful.")
         except Exception as e:
             logger.error(f"API Connection Failed: {e}")
-
-        # --- SPECIAL BNB DIAGNOSTIC TEST ---
-        logger.info("--- DIAGNOSTIC: BNB TEST ORDER ---")
-        try:
-            # 1. Verify Symbol Mapping
-            test_symbol = SYMBOL_MAP.get("BNBUSDT", "pf_bnbusd") 
-            logger.info(f"Testing Symbol: {test_symbol}")
-
-            # 2. Get Price for Safe Limit
-            tickers = self.kf.get_tickers()
-            mark_price = 0.0
-            for t in tickers.get("tickers", []):
-                if t["symbol"].lower() == test_symbol.lower():
-                    mark_price = float(t["markPrice"])
-                    break
-            
-            if mark_price > 0:
-                safe_limit = round(mark_price * 0.5, 2) # 50% below market
-                
-                # 3. Construct Order (Size 0.1 is usually valid for BNB)
-                order_payload = {
-                    "orderType": "lmt", 
-                    "symbol": test_symbol, 
-                    "side": "buy",
-                    "size": 0.1, 
-                    "limitPrice": safe_limit,
-                    "reduceOnly": False  # <--- CRITICAL FIX
-                }
-                
-                logger.info(f"Sending Payload: {order_payload}")
-                
-                # 4. SEND AND PRINT RAW RESPONSE
-                resp = self.kf.send_order(order_payload)
-                logger.info(f"🛑 RAW API RESPONSE (BNB): {resp}")
-
-                # 5. Immediate Cleanup
-                if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
-                    oid = resp["sendStatus"]["order_id"]
-                    logger.info(f"Order placed successfully (ID: {oid}). Cancelling now...")
-                    self.kf.cancel_order({"order_id": oid, "symbol": test_symbol})
-                else:
-                    logger.error("Order failed to place. Check the RAW RESPONSE above.")
-            else:
-                logger.error("Could not fetch Mark Price for BNB. Is the symbol correct?")
-
-        except Exception as e:
-            logger.error(f"BNB TEST EXCEPTION: {e}")
-        logger.info("--- DIAGNOSTIC COMPLETE ---")
 
         logger.info("Initialization Complete. Bot ready.")
 
