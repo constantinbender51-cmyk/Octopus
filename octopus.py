@@ -124,7 +124,7 @@ class Octopus:
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.instrument_specs = {}
 
-        def initialize(self):
+    def initialize(self):
         logger.info("Initializing Octopus (Remote Feed Mode)...")
         self._fetch_instrument_specs()
         
@@ -188,6 +188,24 @@ class Octopus:
 
         logger.info("Initialization Complete. Bot ready.")
 
+    def _fetch_instrument_specs(self):
+        try:
+            url = "https://futures.kraken.com/derivatives/api/v3/instruments"
+            resp = requests.get(url).json()
+            if "instruments" in resp:
+                for inst in resp["instruments"]:
+                    sym = inst["symbol"].lower()
+                    tick_size = float(inst.get("tickSize", 0.1))
+                    precision = inst.get("contractValueTradePrecision")
+                    size_step = 10 ** (-int(precision)) if precision is not None else 1.0
+                    
+                    self.instrument_specs[sym] = {
+                        "sizeStep": size_step,
+                        "tickSize": tick_size,
+                        "contractSize": float(inst.get("contractSize", 1.0))
+                    }
+        except Exception as e:
+            logger.error(f"Error fetching specs: {e}")
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
