@@ -163,7 +163,8 @@ class Octopus:
                     "symbol": test_symbol, 
                     "side": "buy",
                     "size": 0.1, 
-                    "limitPrice": safe_limit
+                    "limitPrice": safe_limit,
+                    "reduceOnly": False  # <--- CRITICAL FIX
                 }
                 
                 logger.info(f"Sending Payload: {order_payload}")
