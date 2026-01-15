@@ -190,9 +190,9 @@ class Octopus:
         while True:
             now = datetime.now(timezone.utc)
             
-            # Trigger every 15 minutes at second 20 (giving server time to update)
-            # Changed from 10 <= now.second < 15 to 20 <= now.second < 25
-            if now.minute % 15 == 0 and 20 <= now.second < 25:
+            # Trigger every 15 minutes at second 30 (giving server time to update)
+            # Feed updates at 25s, so we wait until 30s to be safe.
+            if now.minute % 15 == 0 and 30 <= now.second < 35:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 
                 self._process_signals()
