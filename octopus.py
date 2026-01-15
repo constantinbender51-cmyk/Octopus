@@ -42,16 +42,31 @@ SIGNAL_FEED_URL = "https://octopus-feed.up.railway.app/"
 
 # Asset Mapping (Feed Symbol -> Kraken Futures Perpetual)
 SYMBOL_MAP = {
-    "BTCUSDT": "ff_xbtusd_260327", # Changed from original to match your file
+    # --- Majors ---
+    "BTCUSDT": "ff_xbtusd_260327", # Kept your existing fixed maturity preference
     "ETHUSDT": "pf_ethusd",
     "SOLUSDT": "pf_solusd",
     "BNBUSDT": "pf_bnbusd",
     "XRPUSDT": "pf_xrpusd",
     "ADAUSDT": "pf_adausd",
+    
+    # --- Alts (Existing) ---
     "DOGEUSDT": "pf_dogeusd",
     "AVAXUSDT": "pf_avaxusd",
     "DOTUSDT": "pf_dotusd",
     "LINKUSDT": "pf_linkusd",
+
+    # --- NEWLY ADDED (Expanded Universe) ---
+    "TRXUSDT": "pf_trxusd",
+    "BCHUSDT": "pf_bchusd",
+    "XLMUSDT": "pf_xlmusd",
+    "LTCUSDT": "pf_ltcusd",
+    "SUIUSDT": "pf_suiusd",
+    "HBARUSDT": "pf_hbarusd",
+    "SHIBUSDT": "pf_shibusd", 
+    "TONUSDT": "pf_tonusd",
+    "UNIUSDT": "pf_uniusd",
+    "ZECUSDT": "pf_zecusd",
 }
 
 logging.basicConfig(
