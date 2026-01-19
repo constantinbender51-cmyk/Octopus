@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
 """
 Octopus: Remote Signal Aggregator & Execution Engine.
-Fetches signals from 'https://octopus-feed.up.railway.app/'
-- REMOVED: Local Training, JSON loading, Pandas Resampling.
-- ADDED: HTML Scraping, Signal Parsing.
-- RETAINED: Kraken Futures Execution, Maker Loop, Risk Management.
+Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictions'
+- REMOVED: HTML Scraping, Regex Parsing.
+- ADDED: JSON API Integration.
+- UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
 """
 
 import os
 import sys
 import time
-import re
 import logging
 import requests
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 # --- Local Imports ---
 try:
     from kraken_futures import KrakenFuturesApi
-    import stress_test
+    # import stress_test # Optional: Commented out if not present
 except ImportError as e:
     print(f"CRITICAL: Import failed: {e}. Ensure 'kraken_futures.py' is in the directory.")
     sys.exit(1)
@@ -38,7 +37,7 @@ KF_SECRET = os.getenv("KRAKEN_FUTURES_SECRET")
 
 # Global Settings
 LEVERAGE = 70
-SIGNAL_FEED_URL = "https://octopus-feed.up.railway.app/"
+SIGNAL_FEED_URL = "https://workspace-production-9fae.up.railway.app/predictions"
 
 # Asset Mapping (Feed Symbol -> Kraken Futures Perpetual)
 SYMBOL_MAP = {
@@ -50,13 +49,11 @@ SYMBOL_MAP = {
     "XRPUSDT": "pf_xrpusd",
     "ADAUSDT": "pf_adausd",
     
-    # --- Alts (Existing) ---
+    # --- Alts ---
     "DOGEUSDT": "pf_dogeusd",
     "AVAXUSDT": "pf_avaxusd",
     "DOTUSDT": "pf_dotusd",
     "LINKUSDT": "pf_linkusd",
-
-    # --- NEWLY ADDED (Expanded Universe) ---
     "TRXUSDT": "pf_trxusd",
     "BCHUSDT": "pf_bchusd",
     "XLMUSDT": "pf_xlmusd",
@@ -81,50 +78,36 @@ logger = logging.getLogger("Octopus")
 class SignalFetcher:
     def __init__(self, url):
         self.url = url
-        # Regex to find the main table rows
-        self.row_pattern = re.compile(r"<tr>\s*<td>(.*?)</td>(.*?)</tr>", re.DOTALL)
-        # Regex to find cells within a row
-        self.cell_pattern = re.compile(r"<td class='(.*?)'>(.*?)</td>", re.DOTALL)
 
-    def fetch_signals(self) -> Dict[str, int]:
+    def fetch_signals(self) -> Tuple[Dict[str, int], int]:
         """
-        Scrapes the website and returns a dictionary of Net Votes per Asset.
-        Returns: { "BTCUSDT": 2, "ETHUSDT": -1, ... }
-        Also returns the total count of strategies (cells) found for sizing.
+        Fetches JSON from the API and returns:
+        1. A dict of {Asset: Sum} (Net Vote)
+        2. The total count of assets in the feed (TradedAssets)
         """
         try:
             logger.info(f"Fetching signals from {self.url}...")
             resp = requests.get(self.url, timeout=10)
             resp.raise_for_status()
-            html = resp.text
-
-            # Parse Table
-            matches = self.row_pattern.findall(html)
+            
+            # Expected format: {"BTCUSDT": {"sum": 0}, "ETHUSDT": {"sum": 1}, ...}
+            data = resp.json()
             
             asset_votes = {}
-            total_strategies = 0
+            # The 'traded_assets' count is the total universe size in the feed
+            traded_assets_count = len(data)
 
-            for asset_name, cells_html in matches:
+            for asset_name, metrics in data.items():
+                # Skip assets we don't have mapped
                 if asset_name not in SYMBOL_MAP:
                     continue
 
-                cells = self.cell_pattern.findall(cells_html)
-                net_vote = 0
-                
-                for cls, txt in cells:
-                    total_strategies += 1
-                    txt = txt.strip().upper()
-                    
-                    if "BUY" in txt:
-                        net_vote += 1
-                    elif "SELL" in txt:
-                        net_vote -= 1
-                    # WAIT/NEUTRAL is 0
-
+                # Extract the 'sum' value
+                net_vote = int(metrics.get("sum", 0))
                 asset_votes[asset_name] = net_vote
             
-            logger.info(f"Parsed {total_strategies} total strategy cells.")
-            return asset_votes, total_strategies
+            logger.info(f"Parsed {len(asset_votes)} active assets from a universe of {traded_assets_count}.")
+            return asset_votes, traded_assets_count
 
         except Exception as e:
             logger.error(f"Failed to fetch signals: {e}")
@@ -140,10 +123,10 @@ class Octopus:
         self.instrument_specs = {}
 
     def initialize(self):
-        logger.info("Initializing Octopus (Remote Feed Mode)...")
+        logger.info("Initializing Octopus (JSON API Mode)...")
         self._fetch_instrument_specs()
         
-        # Stress Test (Optional, keeps connection warm)
+        # Connection Check
         logger.info("Checking API Connection...")
         try:
             acc = self.kf.get_accounts()
@@ -190,8 +173,7 @@ class Octopus:
         while True:
             now = datetime.now(timezone.utc)
             
-            # Trigger every 15 minutes at second 30 (giving server time to update)
-            # Feed updates at 25s, so we wait until 30s to be safe.
+            # Trigger every 15 minutes at second 30
             if now.minute % 15 == 0 and 30 <= now.second < 35:
                 logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 
@@ -203,10 +185,10 @@ class Octopus:
 
     def _process_signals(self):
         # 1. Fetch Signals
-        asset_votes, total_strategies = self.fetcher.fetch_signals()
+        asset_votes, traded_assets_count = self.fetcher.fetch_signals()
         
-        if total_strategies == 0:
-            logger.warning("No strategies found on feed. Skipping execution.")
+        if traded_assets_count == 0:
+            logger.warning("No assets found in feed. Skipping execution.")
             return
 
         # 2. Get Account Equity
@@ -227,22 +209,27 @@ class Octopus:
             logger.error(f"Account fetch failed: {e}")
             return
 
-        # 3. Calculate Unit Size
-        # Formula: (Equity * Leverage) / Total Cells in Matrix
-        unit_size_usd = (equity * LEVERAGE) / total_strategies
-        logger.info(f"Equity: ${equity:.2f} | Strategies: {total_strategies} | Unit: ${unit_size_usd:.2f}")
+        # 3. Calculate Target Allocations
+        # Formula: Target Position = Leverage * Sum * MarginEquity / TradedAssets
+        # We calculate the base unit size first: (Equity * Leverage) / TradedAssets
+        
+        unit_size_usd = (equity * LEVERAGE) / traded_assets_count
+        logger.info(f"Equity: ${equity:.2f} | Traded Assets: {traded_assets_count} | Unit Base: ${unit_size_usd:.2f}")
 
         # 4. Execute per Asset
-        # Use Sprint settings (faster execution) as this is a reactive update
         exec_duration = 60
         exec_interval = 5
         start_offset_bp = 0 
         step_bp = 1.0 
 
-        for asset, net_vote in asset_votes.items():
-            target_usd = net_vote * unit_size_usd
-            logger.info(f"[{asset}] Net Vote: {net_vote} -> Target Alloc: ${target_usd:.2f}")
+        for asset, sum_val in asset_votes.items():
+            # Target = Unit * Sum
+            target_usd = unit_size_usd * sum_val
             
+            if sum_val != 0:
+                logger.info(f"[{asset}] Sum: {sum_val} -> Target Alloc: ${target_usd:.2f}")
+            
+            # We execute even if target is 0 to close existing positions if needed
             self.executor.submit(
                 self._execute_single_asset_logic, 
                 asset, 
@@ -280,7 +267,7 @@ class Octopus:
             
             if mark_price == 0: return
             
-            # Calculate Delta
+            # Calculate Delta in Contracts
             target_contracts = net_target_usd / mark_price
             delta = target_contracts - current_pos_size
             
@@ -288,6 +275,7 @@ class Octopus:
             size_increment = specs['sizeStep'] if specs else 0.001
             check_qty = self._round_to_step(abs(delta), size_increment)
 
+            # Filter dust
             if check_qty < size_increment: 
                 return
 
