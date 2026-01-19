@@ -5,8 +5,8 @@ Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictio
 - REMOVED: HTML Scraping, Regex Parsing.
 - ADDED: JSON API Integration.
 - UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
-- UPDATED: Execution Logic (Dynamic Remainder Calculation for Limits & Market Fallback).
-- UPDATED: Increased Limit Order edits to 20 steps.
+- UPDATED: Execution Logic (Dynamic Remainder, 210s Duration, 10s Intervals).
+- ADDED: Custom print function with 0.1s delay.
 """
 
 import os
@@ -117,22 +117,32 @@ class Octopus:
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.instrument_specs = {}
 
+    def _log(self, msg: str, level: str = "info"):
+        """Custom print function with 0.1s delay."""
+        if level == "info":
+            logger.info(msg)
+        elif level == "warning":
+            logger.warning(msg)
+        elif level == "error":
+            logger.error(msg)
+        time.sleep(0.1)
+
     def initialize(self):
-        logger.info("Initializing Octopus (JSON API Mode)...")
+        self._log("Initializing Octopus (JSON API Mode)...")
         self._fetch_instrument_specs()
         
         # Connection Check
-        logger.info("Checking API Connection...")
+        self._log("Checking API Connection...")
         try:
             acc = self.kf.get_accounts()
             if "error" in acc:
-                logger.error(f"API Error: {acc}")
+                self._log(f"API Error: {acc}", level="error")
             else:
-                logger.info("API Connection Successful.")
+                self._log("API Connection Successful.")
         except Exception as e:
-            logger.error(f"API Connection Failed: {e}")
+            self._log(f"API Connection Failed: {e}", level="error")
 
-        logger.info("Initialization Complete. Bot ready.")
+        self._log("Initialization Complete. Bot ready.")
 
     def _fetch_instrument_specs(self):
         try:
@@ -151,7 +161,7 @@ class Octopus:
                         "contractSize": float(inst.get("contractSize", 1.0))
                     }
         except Exception as e:
-            logger.error(f"Error fetching specs: {e}")
+            self._log(f"Error fetching specs: {e}", level="error")
 
     def _round_to_step(self, value: float, step: float) -> float:
         if step == 0: return value
@@ -179,7 +189,7 @@ class Octopus:
                         current_pos_size = size
                         break
         except Exception as e:
-            logger.error(f"[{kf_symbol}] Pos Fetch Error: {e}")
+            self._log(f"[{kf_symbol}] Pos Fetch Error: {e}", level="error")
             
         # 2. Get Mark Price
         try:
@@ -189,18 +199,18 @@ class Octopus:
                     mark_price = float(t["markPrice"])
                     break
         except Exception as e:
-            logger.error(f"[{kf_symbol}] Ticker Fetch Error: {e}")
+            self._log(f"[{kf_symbol}] Ticker Fetch Error: {e}", level="error")
             
         return current_pos_size, mark_price
 
     def run(self):
-        logger.info("Bot started. Syncing with 15m intervals...")
+        self._log("Bot started. Syncing with 15m intervals...")
         while True:
             now = datetime.now(timezone.utc)
             
             # Trigger every 15 minutes at second 30
             if now.minute % 15 == 0 and 30 <= now.second < 35:
-                logger.info(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
+                self._log(f"--- Trigger: {now.strftime('%H:%M:%S')} ---")
                 self._process_signals()
                 time.sleep(50) 
                 
@@ -211,7 +221,7 @@ class Octopus:
         asset_votes, traded_assets_count = self.fetcher.fetch_signals()
         
         if traded_assets_count == 0:
-            logger.warning("No assets found in feed. Skipping execution.")
+            self._log("No assets found in feed. Skipping execution.", level="warning")
             return
 
         # 2. Get Account Equity
@@ -226,22 +236,22 @@ class Octopus:
                 equity = 0
                 
             if equity <= 0:
-                logger.error("Equity 0. Aborting.")
+                self._log("Equity 0. Aborting.", level="error")
                 return
         except Exception as e:
-            logger.error(f"Account fetch failed: {e}")
+            self._log(f"Account fetch failed: {e}", level="error")
             return
 
         # 3. Calculate Unit Size
         unit_size_usd = (equity * LEVERAGE) / traded_assets_count
-        logger.info(f"Equity: ${equity:.2f} | Traded Assets: {traded_assets_count} | Unit Base: ${unit_size_usd:.2f}")
+        self._log(f"Equity: ${equity:.2f} | Traded Assets: {traded_assets_count} | Unit Base: ${unit_size_usd:.2f}")
 
         # 4. Execute per Asset
         for asset, sum_val in asset_votes.items():
             target_usd = unit_size_usd * sum_val
             
             if sum_val != 0:
-                logger.info(f"[{asset}] Sum: {sum_val} -> Target Alloc: ${target_usd:.2f}")
+                self._log(f"[{asset}] Sum: {sum_val} -> Target Alloc: ${target_usd:.2f}")
             
             self.executor.submit(self._execute_single_asset_logic, asset, target_usd)
 
@@ -253,24 +263,24 @@ class Octopus:
             # Initial State Check to determine absolute target in contracts
             current_pos, mark_price = self._get_current_state(kf_symbol)
             if mark_price == 0:
-                logger.warning(f"[{kf_symbol}] Mark price 0, skipping.")
+                self._log(f"[{kf_symbol}] Mark price 0, skipping.", level="warning")
                 return
 
             # Calculate Absolute Target in Contracts
             target_contracts = net_target_usd / mark_price
             
-            logger.info(f"[{kf_symbol}] Logic Start. Curr: {current_pos:.4f} -> Target: {target_contracts:.4f}")
+            self._log(f"[{kf_symbol}] Logic Start. Curr: {current_pos:.4f} -> Target: {target_contracts:.4f}")
             
             self._execute_smooth_order(kf_symbol, target_contracts)
 
         except Exception as e:
-            logger.error(f"[{kf_symbol}] Exec Error: {e}")
+            self._log(f"[{kf_symbol}] Exec Error: {e}", level="error")
 
     def _execute_smooth_order(self, symbol: str, target_contracts: float):
         """
         Executes orders smoothly:
-        1. Starts limit order 0.05% away (opposite direction).
-        2. Updates 20 times, moving 10% closer to Mark Price each time.
+        1. Starts limit order 0.05% away.
+        2. Updates 21 times (every 10s) = 210s total duration.
         3. CRITICAL: Re-calculates 'delta' (remaining needed) at every step.
         4. If not filled at end, sends Market Order for the EXACT remaining delta.
         """
@@ -280,7 +290,10 @@ class Octopus:
         price_inc = specs['tickSize'] if specs else 0.01
 
         # Execution parameters
-        TOTAL_STEPS = 20
+        # 21 steps * 10s = 210s total
+        TOTAL_STEPS = 21
+        STEP_INTERVAL = 10 
+        
         START_OFFSET_PCT = 0.0005 # 0.05%
         DECAY_FACTOR = 0.90 # Move 10% closer each step
         
@@ -297,7 +310,7 @@ class Octopus:
                 
                 # Check if we are "reasonably close" (within 1 size increment)
                 if abs(delta) < size_inc:
-                    logger.info(f"[{symbol}] Target reached (Delta: {delta}). Stopping.")
+                    self._log(f"[{symbol}] Target reached (Delta: {delta}). Stopping.")
                     if order_id: self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
                     return
 
@@ -313,7 +326,7 @@ class Octopus:
                                 break
                     
                     if not is_open:
-                        logger.info(f"[{symbol}] Order {order_id} not found/filled. Recalculating.")
+                        self._log(f"[{symbol}] Order {order_id} not found/filled. Recalculating.")
                         order_id = None
                         # Continue to next loop to re-measure 'delta' with new position
                         continue 
@@ -340,7 +353,7 @@ class Octopus:
                 # 4. Place or Edit Order
                 if order_id is None:
                     # New Order
-                    logger.info(f"[{symbol}] Placing Limit {side.upper()} @ {limit_price} Size: {order_size} (Offset: {current_offset*100:.4f}%)")
+                    self._log(f"[{symbol}] Placing Limit {side.upper()} @ {limit_price} Size: {order_size} (Offset: {current_offset*100:.4f}%)")
                     resp = self.kf.send_order({
                         "orderType": "lmt",
                         "symbol": symbol,
@@ -351,10 +364,10 @@ class Octopus:
                     if "sendStatus" in resp and "order_id" in resp["sendStatus"]:
                         order_id = resp["sendStatus"]["order_id"]
                     else:
-                        logger.warning(f"[{symbol}] Limit Order Failed: {resp}")
+                        self._log(f"[{symbol}] Limit Order Failed: {resp}", level="warning")
                 else:
                     # Edit Order - Updates Size to match current remainder
-                    logger.info(f"[{symbol}] Updating Limit @ {limit_price} Size: {order_size} (Remaining)")
+                    self._log(f"[{symbol}] Updating Limit @ {limit_price} Size: {order_size} (Remaining)")
                     resp = self.kf.edit_order({
                         "orderId": order_id,
                         "limitPrice": limit_price,
@@ -367,10 +380,10 @@ class Octopus:
                              order_id = None
 
                 # Wait between updates
-                time.sleep(5)
+                time.sleep(STEP_INTERVAL)
 
             except Exception as e:
-                logger.error(f"[{symbol}] Limit Loop Error: {e}")
+                self._log(f"[{symbol}] Limit Loop Error: {e}", level="error")
                 time.sleep(1)
 
         # --- End of Loop Cleanup ---
@@ -386,7 +399,7 @@ class Octopus:
             final_delta = target_contracts - curr_pos
             
             if abs(final_delta) >= size_inc:
-                logger.info(f"[{symbol}] Limit Loop Done. MKT Execute Remaining: {final_delta:.4f}")
+                self._log(f"[{symbol}] Limit Loop Done (210s). MKT Execute Remaining: {final_delta:.4f}")
                 side = "buy" if final_delta > 0 else "sell"
                 final_size = self._round_to_step(abs(final_delta), size_inc)
                 
@@ -397,10 +410,10 @@ class Octopus:
                     "size": final_size
                 })
             else:
-                logger.info(f"[{symbol}] Target Reached. No Market Order needed.")
+                self._log(f"[{symbol}] Target Reached. No Market Order needed.")
 
         except Exception as e:
-            logger.error(f"[{symbol}] Market Fallback Error: {e}")
+            self._log(f"[{symbol}] Market Fallback Error: {e}", level="error")
 
 if __name__ == "__main__":
     bot = Octopus()
