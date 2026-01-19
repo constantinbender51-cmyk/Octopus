@@ -5,7 +5,8 @@ Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictio
 - REMOVED: HTML Scraping, Regex Parsing.
 - ADDED: JSON API Integration.
 - UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
-- UPDATED: Execution Logic (Smooth Limit Decay + Market Fallback).
+- UPDATED: Execution Logic (Dynamic Remainder Calculation for Limits & Market Fallback).
+- UPDATED: Increased Limit Order edits to 20 steps.
 """
 
 import os
@@ -269,9 +270,9 @@ class Octopus:
         """
         Executes orders smoothly:
         1. Starts limit order 0.05% away (opposite direction).
-        2. Updates 8 times, moving 10% closer to Mark Price each time.
-        3. Checks if order is filled (via OpenOrders) or target reached.
-        4. If not filled at end, sends Market Order.
+        2. Updates 20 times, moving 10% closer to Mark Price each time.
+        3. CRITICAL: Re-calculates 'delta' (remaining needed) at every step.
+        4. If not filled at end, sends Market Order for the EXACT remaining delta.
         """
         
         specs = self.instrument_specs.get(symbol.lower())
@@ -279,7 +280,7 @@ class Octopus:
         price_inc = specs['tickSize'] if specs else 0.01
 
         # Execution parameters
-        TOTAL_STEPS = 8
+        TOTAL_STEPS = 20
         START_OFFSET_PCT = 0.0005 # 0.05%
         DECAY_FACTOR = 0.90 # Move 10% closer each step
         
@@ -288,21 +289,20 @@ class Octopus:
         # Loop for smooth limit execution
         for i in range(TOTAL_STEPS):
             try:
-                # 1. Refresh State
+                # 1. RE-CALCULATE REMAINDER (The "Remaining" Check)
                 curr_pos, curr_mark = self._get_current_state(symbol)
                 if curr_mark == 0: break
 
-                # 2. Calculate Remaining Delta
                 delta = target_contracts - curr_pos
                 
-                # Check if we are "reasonably close" (within 1 size increment or close enough)
+                # Check if we are "reasonably close" (within 1 size increment)
                 if abs(delta) < size_inc:
                     logger.info(f"[{symbol}] Target reached (Delta: {delta}). Stopping.")
                     if order_id: self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
                     return
 
-                # 3. Check Open Orders to detect fills
-                # If we have an order_id, but it's not in open orders, it's likely filled
+                # 2. Check Open Orders to detect fills
+                # If order exists locally but not in API, it must have filled fully
                 if order_id:
                     open_orders = self.kf.get_open_orders()
                     is_open = False
@@ -313,15 +313,14 @@ class Octopus:
                                 break
                     
                     if not is_open:
-                        logger.info(f"[{symbol}] Previous order {order_id} not found (Filled?). Re-assessing position.")
+                        logger.info(f"[{symbol}] Order {order_id} not found/filled. Recalculating.")
                         order_id = None
-                        continue # Skip to next loop to re-calc delta based on new position
+                        # Continue to next loop to re-measure 'delta' with new position
+                        continue 
 
-                # 4. Calculate Price
-                # Decay the offset: Offset * (0.9 ^ step)
+                # 3. Calculate Price & Size
                 current_offset = START_OFFSET_PCT * (DECAY_FACTOR ** i)
                 
-                # Direction logic
                 side = "buy" if delta > 0 else "sell"
                 if side == "buy":
                     # Buy Limit below mark
@@ -331,15 +330,17 @@ class Octopus:
                     limit_price = curr_mark * (1 + current_offset)
 
                 limit_price = self._round_to_step(limit_price, price_inc)
+                
+                # STRICTLY USE REMAINDER AS SIZE
                 order_size = self._round_to_step(abs(delta), size_inc)
 
                 if order_size < size_inc:
                     continue
 
-                # 5. Place or Edit Order
+                # 4. Place or Edit Order
                 if order_id is None:
                     # New Order
-                    logger.info(f"[{symbol}] Placing Limit {side.upper()} @ {limit_price} (Offset: {current_offset*100:.4f}%)")
+                    logger.info(f"[{symbol}] Placing Limit {side.upper()} @ {limit_price} Size: {order_size} (Offset: {current_offset*100:.4f}%)")
                     resp = self.kf.send_order({
                         "orderType": "lmt",
                         "symbol": symbol,
@@ -352,8 +353,8 @@ class Octopus:
                     else:
                         logger.warning(f"[{symbol}] Limit Order Failed: {resp}")
                 else:
-                    # Edit Order
-                    logger.info(f"[{symbol}] Updating Limit @ {limit_price} (Offset: {current_offset*100:.4f}%)")
+                    # Edit Order - Updates Size to match current remainder
+                    logger.info(f"[{symbol}] Updating Limit @ {limit_price} Size: {order_size} (Remaining)")
                     resp = self.kf.edit_order({
                         "orderId": order_id,
                         "limitPrice": limit_price,
@@ -361,11 +362,11 @@ class Octopus:
                         "symbol": symbol
                     })
                     if "editStatus" in resp and "status" in resp["editStatus"]:
-                         # If edit failed (e.g. filled while editing), reset order_id
                          if resp["editStatus"]["status"] != "edited":
+                             # Order likely filled or cancelled during edit
                              order_id = None
 
-                # Wait between updates (approx 5-6s to allow market reaction)
+                # Wait between updates
                 time.sleep(5)
 
             except Exception as e:
@@ -378,14 +379,14 @@ class Octopus:
                 self.kf.cancel_order({"order_id": order_id, "symbol": symbol})
             except: pass
 
-        # --- Final Market Fallback ---
-        # If we still haven't reached the target, take what's available
+        # --- Final Market Fallback (Remainder Only) ---
         try:
+            # RE-CALCULATE REMAINDER FINAL TIME
             curr_pos, _ = self._get_current_state(symbol)
             final_delta = target_contracts - curr_pos
             
             if abs(final_delta) >= size_inc:
-                logger.info(f"[{symbol}] Loop ended. Executing Market Order for remaining: {final_delta:.4f}")
+                logger.info(f"[{symbol}] Limit Loop Done. MKT Execute Remaining: {final_delta:.4f}")
                 side = "buy" if final_delta > 0 else "sell"
                 final_size = self._round_to_step(abs(final_delta), size_inc)
                 
@@ -396,7 +397,7 @@ class Octopus:
                     "size": final_size
                 })
             else:
-                logger.info(f"[{symbol}] Execution Complete. Target Reached.")
+                logger.info(f"[{symbol}] Target Reached. No Market Order needed.")
 
         except Exception as e:
             logger.error(f"[{symbol}] Market Fallback Error: {e}")
