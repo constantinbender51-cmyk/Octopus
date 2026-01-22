@@ -7,6 +7,7 @@ Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictio
 - UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
 - UPDATED: Execution Logic (Dynamic Remainder, 210s Duration, 10s Intervals).
 - ADDED: Custom print function with 0.1s delay.
+- UPDATED: Component-based Signal Calculation (Timeframe Aware).
 """
 
 import os
@@ -82,9 +83,12 @@ class SignalFetcher:
 
     def fetch_signals(self) -> Tuple[Dict[str, int], int]:
         """
-        Fetches JSON from the API and returns:
-        1. A dict of {Asset: Sum} (Net Vote)
-        2. The total count of assets in the feed (TradedAssets)
+        Fetches JSON from the API and calculates the net vote based on candle closes.
+        Logic:
+        - 1d Close (00:00 UTC): Sum all 5 components.
+        - 4h Close (04:00, 08:00...): Sum 4 components (Exclude 1d).
+        - 1h Close (xx:00): Sum 3 components (Exclude 4h, 1d).
+        - 15m Close (xx:15, xx:30, xx:45): Sum 2 components (Exclude 1h, 4h, 1d).
         """
         try:
             logger.info(f"Fetching signals from {self.url}...")
@@ -95,10 +99,41 @@ class SignalFetcher:
             asset_votes = {}
             traded_assets_count = len(data)
 
+            # Determine Logic Slice based on Current Time
+            now = datetime.now(timezone.utc)
+            
+            # Default: 15m Close (Indices 0, 1) -> Slice 2
+            slice_limit = 2 
+            
+            if now.minute == 0:
+                if now.hour == 0:
+                    # 1d Close: Include all 5 (0,1,2,3,4)
+                    slice_limit = 5
+                elif now.hour % 4 == 0:
+                    # 4h Close: Include 4 (0,1,2,3)
+                    slice_limit = 4
+                else:
+                    # 1h Close: Include 3 (0,1,2)
+                    slice_limit = 3
+            
+            logger.info(f"Time: {now.strftime('%H:%M')} UTC | Slice Limit: {slice_limit} (Components)")
+
             for asset_name, metrics in data.items():
                 if asset_name not in SYMBOL_MAP:
                     continue
-                net_vote = int(metrics.get("sum", 0))
+                
+                # Get components list, default to empty
+                comp = metrics.get("comp", [])
+                
+                if comp and isinstance(comp, list):
+                    # Sum the relevant components based on the calculated slice_limit
+                    # robustly handle cases where len(comp) < slice_limit
+                    valid_slice = min(len(comp), slice_limit)
+                    net_vote = sum(comp[:valid_slice])
+                else:
+                    # Fallback to pre-calculated sum if 'comp' is missing
+                    net_vote = int(metrics.get("sum", 0))
+                
                 asset_votes[asset_name] = net_vote
             
             logger.info(f"Parsed {len(asset_votes)} active assets from a universe of {traded_assets_count}.")
