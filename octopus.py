@@ -7,7 +7,6 @@ Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictio
 - UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
 - UPDATED: Execution Logic (Dynamic Remainder, 210s Duration, 10s Intervals).
 - ADDED: Custom print function with 0.1s delay.
-- UPDATED: Dynamic Timeframe Filtering (Checks only closing candles).
 """
 
 import os
@@ -84,7 +83,7 @@ class SignalFetcher:
     def fetch_signals(self) -> Tuple[Dict[str, int], int]:
         """
         Fetches JSON from the API and returns:
-        1. A dict of {Asset: Sum} (Net Vote based on active timeframes)
+        1. A dict of {Asset: Sum} (Net Vote)
         2. The total count of assets in the feed (TradedAssets)
         """
         try:
@@ -96,39 +95,10 @@ class SignalFetcher:
             asset_votes = {}
             traded_assets_count = len(data)
 
-            # Determine active timeframes based on current time (UTC)
-            now = datetime.now(timezone.utc)
-            minute = now.minute
-            hour = now.hour
-
-            # 15m is always active as the script triggers on 15m boundaries
-            active_keys = ["15m"]
-
-            # 30m closes on :00 and :30
-            if minute % 30 == 0:
-                active_keys.append("30m")
-            
-            # 1h closes on :00
-            if minute == 0:
-                active_keys.append("1h")
-            
-            # 4h closes on :00 when hour % 4 == 0 (00, 04, 08, 12, 16, 20)
-            if minute == 0 and hour % 4 == 0:
-                active_keys.extend(["4h", "240m"]) # Check both keys just in case
-            
-            # 1d closes on 00:00
-            if minute == 0 and hour == 0:
-                active_keys.append("1d")
-
-            logger.info(f"Active Timeframe Keys: {active_keys}")
-
             for asset_name, metrics in data.items():
                 if asset_name not in SYMBOL_MAP:
                     continue
-                
-                # Calculate Sum only for active timeframes
-                # We ignore the pre-calculated "sum" key from the API
-                net_vote = sum(int(metrics.get(k, 0)) for k in active_keys)
+                net_vote = int(metrics.get("sum", 0))
                 asset_votes[asset_name] = net_vote
             
             logger.info(f"Parsed {len(asset_votes)} active assets from a universe of {traded_assets_count}.")
