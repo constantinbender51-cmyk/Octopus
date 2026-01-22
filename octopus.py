@@ -7,7 +7,7 @@ Fetches signals from 'https://workspace-production-9fae.up.railway.app/predictio
 - UPDATED: Sizing Formula (Equity * Leverage * Sum / TradedAssets).
 - UPDATED: Execution Logic (Dynamic Remainder, 210s Duration, 10s Intervals).
 - ADDED: Custom print function with 0.1s delay.
-- UPDATED: Component-based Signal Calculation (Timeframe Aware).
+- UPDATED: Component-based Signal Calculation (Precise Timeframe Logic).
 """
 
 import os
@@ -85,10 +85,11 @@ class SignalFetcher:
         """
         Fetches JSON from the API and calculates the net vote based on candle closes.
         Logic:
-        - 1d Close (00:00 UTC): Sum all 5 components.
-        - 4h Close (04:00, 08:00...): Sum 4 components (Exclude 1d).
-        - 1h Close (xx:00): Sum 3 components (Exclude 4h, 1d).
-        - 15m Close (xx:15, xx:30, xx:45): Sum 2 components (Exclude 1h, 4h, 1d).
+        - 1d Close (00:00 UTC): Sum 5 (0-4)
+        - 4h Close (04:00..): Sum 4 (0-3)
+        - 1h Close (xx:00): Sum 3 (0-2)
+        - 30m Close (xx:30): Sum 2 (0-1)
+        - 15m Close (xx:15, xx:45): Sum 1 (0) -> Pure 15m signal
         """
         try:
             logger.info(f"Fetching signals from {self.url}...")
@@ -102,9 +103,6 @@ class SignalFetcher:
             # Determine Logic Slice based on Current Time
             now = datetime.now(timezone.utc)
             
-            # Default: 15m Close (Indices 0, 1) -> Slice 2
-            slice_limit = 2 
-            
             if now.minute == 0:
                 if now.hour == 0:
                     # 1d Close: Include all 5 (0,1,2,3,4)
@@ -115,6 +113,12 @@ class SignalFetcher:
                 else:
                     # 1h Close: Include 3 (0,1,2)
                     slice_limit = 3
+            elif now.minute == 30:
+                # 30m Close: Include 2 (0,1) -> 15m + 30m
+                slice_limit = 2
+            else:
+                # 15m or 45m Close: Include 1 (0) -> 15m only
+                slice_limit = 1
             
             logger.info(f"Time: {now.strftime('%H:%M')} UTC | Slice Limit: {slice_limit} (Components)")
 
